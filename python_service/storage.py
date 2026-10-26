@@ -103,6 +103,69 @@ def get_mongo_client():
         return None
 
 
+def check_database_health() -> Dict[str, Any]:
+    """
+    Performs a real database connectivity check (e.g. MongoDB ping).
+    Reports honest connection status and latency.
+    """
+    if not MONGODB_URI:
+        return {
+            "connected": True,
+            "database_type": "Local Store (history.json)",
+            "message": "Local JSON store operational."
+        }
+    try:
+        import time
+        client = get_mongo_client()
+        if client:
+            t0 = time.time()
+            client.admin.command("ping")
+            latency_ms = round((time.time() - t0) * 1000, 2)
+            return {
+                "connected": True,
+                "database_type": "MongoDB Atlas",
+                "latency_ms": latency_ms,
+                "message": f"Connected to MongoDB Atlas ({latency_ms}ms ping)."
+            }
+    except Exception as e:
+        logger.error(f"MongoDB ping failed: {e}")
+        return {
+            "connected": False,
+            "database_type": "MongoDB Atlas",
+            "error": f"MongoDB Atlas ping failed: {str(e)}"
+        }
+    return {
+        "connected": False,
+        "database_type": "MongoDB Atlas",
+        "error": "Could not initialize MongoDB client."
+    }
+
+
+_indexes_initialized = False
+
+def ensure_database_indexes():
+    """Ensures owner-scoped and TTL expiry indexes exist on MongoDB Atlas collections."""
+    global _indexes_initialized
+    if _indexes_initialized or not MONGODB_URI:
+        return
+    try:
+        client = get_mongo_client()
+        if client:
+            db = client[MONGODB_DB_NAME]
+            # Owner & creation sort index on verifications
+            db["verifications"].create_index([("owner_uid", 1), ("createdAt", -1)], background=True)
+            db["verifications"].create_index([("expiresAt", 1)], background=True)
+            # Owner index on failed verifications
+            db["failed_verifications"].create_index([("owner_uid", 1), ("createdAt", -1)], background=True)
+            # Reference cards indexes
+            db["identity_references"].create_index([("reference_id", 1)], unique=True, background=True)
+            db["identity_references"].create_index([("owner_uid", 1)], background=True)
+            _indexes_initialized = True
+            logger.info("MongoDB Atlas indexes ensured successfully.")
+    except Exception as e:
+        logger.warning(f"Could not initialize MongoDB indexes: {e}")
+
+
 def sync_record_to_mongodb(collection_name: str, record_id: str, record: dict) -> bool:
     """Syncs a record to MongoDB Atlas using native pymongo (or Data API fallback)."""
     # 1. Native PyMongo (Preferred)
@@ -114,7 +177,8 @@ def sync_record_to_mongodb(collection_name: str, record_id: str, record: dict) -
                 db[collection_name].replace_one({"_id": record_id}, record, upsert=True)
                 return True
         except Exception as e:
-            logger.warning(f"Failed to sync to MongoDB Atlas via PyMongo: {e}")
+            logger.error(f"Failed to sync to MongoDB Atlas via PyMongo: {e}")
+            raise RuntimeError(f"Cloud persistence to MongoDB Atlas failed: {e}")
 
     # 2. Atlas Data API Fallback
     if IS_MONGO_ONLINE and _ATLAS_DATA_URL:
@@ -126,7 +190,8 @@ def sync_record_to_mongodb(collection_name: str, record_id: str, record: dict) -
             })
             return True
         except Exception as e:
-            logger.warning(f"Failed to sync to MongoDB Atlas via Data API: {e}")
+            logger.error(f"Failed to sync to MongoDB Atlas via Data API: {e}")
+            raise RuntimeError(f"Cloud persistence to MongoDB Atlas Data API failed: {e}")
 
     return False
 
@@ -202,7 +267,9 @@ def read_file_records(file_path: str, auto_purge: bool = True) -> List[Dict[str,
             if created_str:
                 try:
                     clean_str = created_str.replace("Z", "+00:00")
-                    created_dt = datetime.fromisoformat(clean_str).replace(tzinfo=None)
+                    created_dt = datetime.fromisoformat(clean_str)
+                    if created_dt.tzinfo is None:
+                        created_dt = created_dt.replace(tzinfo=timezone.utc)
                     age_days = (now - created_dt).total_seconds() / 86400.0
                     if age_days <= RETENTION_DAYS:
                         valid_records.append(doc)
@@ -276,6 +343,8 @@ def save_confirmed_verification(
 
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(days=RETENTION_DAYS)
+    created_at_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    expires_at_iso = expires_at.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     record = {
         "_id": seq_id,
@@ -297,8 +366,8 @@ def save_confirmed_verification(
         "originalFileName": original_filename,
         "thumbnail": thumbnail_image,
         "portraitPhoto": portrait_photo or result_dict.get("portrait_photo"),
-        "createdAt": now.isoformat() + "Z",
-        "expiresAt": expires_at.isoformat() + "Z",
+        "createdAt": created_at_iso,
+        "expiresAt": expires_at_iso,
         "retentionDays": RETENTION_DAYS,
     }
 
@@ -310,7 +379,8 @@ def save_confirmed_verification(
     write_file_records(target_file, records)
 
     # 2. Sync to MongoDB Atlas (PyMongo or Data API)
-    sync_record_to_mongodb(target_collection_name, seq_id, record)
+    if MONGODB_URI:
+        sync_record_to_mongodb(target_collection_name, seq_id, record)
 
     return {
         "id": seq_id,
@@ -330,8 +400,8 @@ def get_history(
     owner_uid: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Retrieves verified SUCCESS records strictly matching BOTH owner_uid AND device_id.
-    Unauthenticated queries or records belonging to other users are never returned.
+    Retrieves verified SUCCESS records strictly matching authenticated owner_uid.
+    Cloud history is available across all of the user's devices.
     """
     if not owner_uid:
         return {
@@ -352,8 +422,6 @@ def get_history(
             if client:
                 db = client[MONGODB_DB_NAME]
                 query: Dict[str, Any] = {"owner_uid": owner_uid}
-                if device_id and device_id != "admin_all":
-                    query["deviceId"] = device_id
                 if doc_type:
                     query["documentType"] = doc_type
 
@@ -379,10 +447,6 @@ def get_history(
 
     history = read_history(auto_purge=True)
     history = [d for d in history if d.get("owner_uid") == owner_uid]
-
-    # Filter by Device ID if provided
-    if device_id and device_id != "admin_all":
-        history = [d for d in history if d.get("deviceId") == device_id]
         
     if doc_type:
         history = [d for d in history if d.get("documentType") == doc_type]
@@ -410,7 +474,7 @@ def get_failed_history(
     device_id: Optional[str] = None,
     owner_uid: Optional[str] = None
 ) -> Dict[str, Any]:
-    """Retrieves FAILED audit records strictly matching BOTH owner_uid AND device_id."""
+    """Retrieves FAILED audit records strictly matching authenticated owner_uid."""
     if not owner_uid:
         return {
             "documents": [],
@@ -429,8 +493,6 @@ def get_failed_history(
             if client:
                 db = client[MONGODB_DB_NAME]
                 query: Dict[str, Any] = {"owner_uid": owner_uid}
-                if device_id and device_id != "admin_all":
-                    query["deviceId"] = device_id
 
                 total = db["failed_verifications"].count_documents(query)
                 cursor = db["failed_verifications"].find(query).sort("createdAt", -1).skip((page - 1) * limit).limit(limit)
@@ -453,9 +515,6 @@ def get_failed_history(
 
     failed = read_failed_history(auto_purge=True)
     failed = [d for d in failed if d.get("owner_uid") == owner_uid]
-
-    if device_id and device_id != "admin_all":
-        failed = [d for d in failed if d.get("deviceId") == device_id]
         
     total = len(failed)
     start = (page - 1) * limit
@@ -478,18 +537,14 @@ def get_extraction_by_id(
     device_id: Optional[str] = None, 
     owner_uid: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
-    """Retrieves a single verification record verifying BOTH owner_uid and device_id."""
+    """Retrieves a single verification record verifying authenticated owner_uid."""
     if not owner_uid:
         return None
 
     history = read_history(auto_purge=True)
     for doc in history:
         if doc.get("_id") == doc_id or doc.get("sequentialId") == doc_id:
-            # Check ownership
             if doc.get("owner_uid") != owner_uid:
-                return None
-            # Check device isolation
-            if device_id and device_id != "admin_all" and doc.get("deviceId") != device_id:
                 return None
             return doc
 
@@ -499,10 +554,7 @@ def get_extraction_by_id(
             client = get_mongo_client()
             if client:
                 db = client[MONGODB_DB_NAME]
-                query = {"_id": doc_id, "owner_uid": owner_uid}
-                if device_id and device_id != "admin_all":
-                    query["deviceId"] = device_id
-                doc = db["verifications"].find_one(query)
+                doc = db["verifications"].find_one({"_id": doc_id, "owner_uid": owner_uid})
                 if doc:
                     return doc
         except Exception:
@@ -516,7 +568,7 @@ def delete_extraction_by_id(
     device_id: Optional[str] = None, 
     owner_uid: Optional[str] = None
 ) -> bool:
-    """Deletes a verification record strictly verifying BOTH owner_uid and device_id."""
+    """Deletes a verification record strictly verifying authenticated owner_uid."""
     if not owner_uid:
         return False
 
@@ -527,9 +579,6 @@ def delete_extraction_by_id(
         if d.get("_id") == doc_id or d.get("sequentialId") == doc_id:
             # Only delete if owner matches
             if d.get("owner_uid") != owner_uid:
-                new_history.append(d)
-                continue
-            if device_id and device_id != "admin_all" and d.get("deviceId") != device_id:
                 new_history.append(d)
                 continue
             found = True
@@ -543,10 +592,7 @@ def delete_extraction_by_id(
                 client = get_mongo_client()
                 if client:
                     db = client[MONGODB_DB_NAME]
-                    del_query = {"_id": doc_id, "owner_uid": owner_uid}
-                    if device_id and device_id != "admin_all":
-                        del_query["deviceId"] = device_id
-                    db["verifications"].delete_one(del_query)
+                    db["verifications"].delete_one({"_id": doc_id, "owner_uid": owner_uid})
             except Exception:
                 pass
         return True
@@ -557,7 +603,7 @@ def get_storage_stats(
     device_id: Optional[str] = None, 
     owner_uid: Optional[str] = None
 ) -> Dict[str, Any]:
-    """Returns storage space usage and record count for the requesting authenticated user & device."""
+    """Returns storage space usage and record count for the requesting authenticated user."""
     history = read_history(auto_purge=True)
     failed = read_failed_history(auto_purge=True)
     
@@ -568,11 +614,6 @@ def get_storage_stats(
         user_history = []
         user_failed = []
 
-    if device_id and device_id != "admin_all":
-        device_records = [d for d in user_history if d.get("deviceId") == device_id]
-    else:
-        device_records = user_history
-
     file_size_bytes = 0
     for fp in [HISTORY_FILE, FAILED_HISTORY_FILE]:
         if os.path.exists(fp):
@@ -582,7 +623,7 @@ def get_storage_stats(
     mb_size = round(file_size_bytes / (1024.0 * 1024.0), 2)
 
     return {
-        "deviceRecords": len(device_records),
+        "deviceRecords": len(user_history),
         "totalSuccessRecords": len(user_history),
         "totalFailedRecords": len(user_failed),
         "totalRecords": len(user_history) + len(user_failed),
@@ -603,30 +644,90 @@ def clean_storage(
     owner_uid: Optional[str] = None, 
     force_all: bool = False
 ) -> Dict[str, Any]:
-    """Purges expired records or clears storage strictly for the requesting authenticated user and device."""
+    """
+    Purges expired records (>30 days) strictly for the requesting authenticated user.
+    If force_all=False, preserves fresh records (<=30 days).
+    Never touches another user's records or reference cards.
+    """
     if not owner_uid:
-        return {"message": "Authentication required to clean storage.", "remaining": 0}
+        return {"message": "Authentication required to clean storage.", "deleted_count": 0}
 
-    # Only clear records belonging to THIS user and THIS device
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=RETENTION_DAYS)
+    cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+    now_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def is_eligible_for_deletion(doc: dict) -> bool:
+        if doc.get("owner_uid") != owner_uid:
+            return False
+        if force_all:
+            return True
+        # Check explicit expiresAt
+        exp_str = doc.get("expiresAt")
+        if exp_str:
+            try:
+                exp_dt = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
+                if exp_dt <= now:
+                    return True
+            except Exception:
+                pass
+        # Check createdAt
+        c_str = doc.get("createdAt")
+        if c_str:
+            try:
+                c_dt = datetime.fromisoformat(c_str.replace("Z", "+00:00"))
+                if c_dt <= cutoff:
+                    return True
+            except Exception:
+                pass
+        return False
+
+    # 1. Clean local JSON files
     history = read_history(auto_purge=False)
-    new_history = [d for d in history if not (d.get("owner_uid") == owner_uid and (not device_id or d.get("deviceId") == device_id))]
+    del_count = 0
+    new_history = []
+    for d in history:
+        if is_eligible_for_deletion(d):
+            del_count += 1
+        else:
+            new_history.append(d)
     write_file_records(HISTORY_FILE, new_history)
 
     failed = read_failed_history(auto_purge=False)
-    new_failed = [d for d in failed if not (d.get("owner_uid") == owner_uid and (not device_id or d.get("deviceId") == device_id))]
+    new_failed = []
+    for d in failed:
+        if is_eligible_for_deletion(d):
+            del_count += 1
+        else:
+            new_failed.append(d)
     write_file_records(FAILED_HISTORY_FILE, new_failed)
 
+    # 2. Clean MongoDB Atlas
     if MONGODB_URI:
         try:
             client = get_mongo_client()
             if client:
                 db = client[MONGODB_DB_NAME]
-                query = {"owner_uid": owner_uid}
-                if device_id and device_id != "admin_all":
-                    query["deviceId"] = device_id
-                db["verifications"].delete_many(query)
-                db["failed_verifications"].delete_many(query)
-        except Exception:
-            pass
+                if force_all:
+                    query: Dict[str, Any] = {"owner_uid": owner_uid}
+                else:
+                    query = {
+                        "owner_uid": owner_uid,
+                        "$or": [
+                            {"expiresAt": {"$lte": now_str}},
+                            {"createdAt": {"$lte": cutoff_str}}
+                        ]
+                    }
+                r1 = db["verifications"].delete_many(query)
+                r2 = db["failed_verifications"].delete_many(query)
+                del_count = max(del_count, r1.deleted_count + r2.deleted_count)
+        except Exception as e:
+            logger.error(f"MongoDB storage cleanup error: {e}")
+            raise RuntimeError(f"Database cleanup error: {e}")
 
-    return {"message": f"Storage cleared for account on device {device_id}.", "remaining": 0}
+    action_label = "Cleaned all records" if force_all else f"Cleaned expired records (>30 days)"
+    return {
+        "message": f"{action_label} successfully for account.",
+        "deleted_count": del_count,
+        "retention_policy": f"{RETENTION_DAYS} days"
+    }

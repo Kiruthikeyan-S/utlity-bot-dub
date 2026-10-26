@@ -219,6 +219,24 @@ def create_identity_reference(
     return reference_record
 
 
+def get_public_reference_card_view(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Returns strictly approved public presentation fields for an Identity Reference Card.
+    Omit all private sensitive attributes: owner_uid, internal verification_id, device_id, and secret qr_token.
+    """
+    return {
+        "reference_id": rec.get("reference_id"),
+        "document_type": rec.get("document_type"),
+        "document_type_display": rec.get("document_type_display"),
+        "name": rec.get("name"),
+        "masked_number": rec.get("masked_number"),
+        "photo": rec.get("photo"),
+        "verification_status": rec.get("verification_status", "DETAILS CONFIRMED"),
+        "created_at": rec.get("created_at"),
+        "revoked": bool(rec.get("revoked", False))
+    }
+
+
 def get_reference_by_id(ref_id: str) -> Optional[Dict[str, Any]]:
     """
     Retrieves a reference card by its privacy Reference ID.

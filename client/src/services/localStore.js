@@ -80,19 +80,18 @@ export async function saveLocalRecord(record, ownerUid, deviceId) {
 }
 
 /**
- * Retrieves all records belonging strictly to (ownerUid, deviceId).
- * Never returns records belonging to any other user or device.
+ * Retrieves all records belonging strictly to ownerUid.
+ * Never returns records belonging to any other user.
  */
-export async function getLocalRecords(ownerUid, deviceId) {
-  if (!ownerUid || !deviceId) return [];
+export async function getLocalRecords(ownerUid) {
+  if (!ownerUid) return [];
   const db = await openDatabase();
-  const partitionKey = buildPartitionKey(ownerUid, deviceId);
 
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, 'readonly');
     const store = tx.objectStore(STORE_NAME);
-    const index = store.index('partitionKey');
-    const req = index.getAll(IDBKeyRange.only(partitionKey));
+    const index = store.index('ownerUid');
+    const req = index.getAll(IDBKeyRange.only(ownerUid));
 
     req.onsuccess = () => {
       const records = req.result || [];
@@ -105,57 +104,119 @@ export async function getLocalRecords(ownerUid, deviceId) {
 }
 
 /**
- * Retrieves a single record by ID if and only if it belongs to (ownerUid, deviceId).
+ * Retrieves a single record by ID if and only if it belongs to ownerUid.
  */
-export async function getLocalRecordById(recordId, ownerUid, deviceId) {
-  if (!recordId || !ownerUid || !deviceId) return null;
+export async function getLocalRecordById(recordId, ownerUid) {
+  if (!recordId || !ownerUid) return null;
   const db = await openDatabase();
-  const partitionKey = buildPartitionKey(ownerUid, deviceId);
-  const storageKey = `${partitionKey}###${recordId}`;
 
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, 'readonly');
     const store = tx.objectStore(STORE_NAME);
-    const req = store.get(storageKey);
+    const index = store.index('ownerUid');
+    const req = index.openCursor(IDBKeyRange.only(ownerUid));
 
-    req.onsuccess = () => resolve(req.result || null);
+    req.onsuccess = (event) => {
+      const cursor = event.target.result;
+      if (cursor) {
+        const val = cursor.value;
+        if (val._id === recordId || val.id === recordId) {
+          resolve(val);
+          return;
+        }
+        cursor.continue();
+      } else {
+        resolve(null);
+      }
+    };
     req.onerror = () => reject(req.error);
   });
 }
 
 /**
- * Deletes a record by ID strictly verifying ownerUid and deviceId.
+ * Deletes a record by ID strictly verifying ownerUid.
  */
-export async function deleteLocalRecord(recordId, ownerUid, deviceId) {
-  if (!recordId || !ownerUid || !deviceId) return false;
+export async function deleteLocalRecord(recordId, ownerUid) {
+  if (!recordId || !ownerUid) return false;
   const db = await openDatabase();
-  const partitionKey = buildPartitionKey(ownerUid, deviceId);
-  const storageKey = `${partitionKey}###${recordId}`;
 
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, 'readwrite');
     const store = tx.objectStore(STORE_NAME);
-    const req = store.delete(storageKey);
+    const index = store.index('ownerUid');
+    const req = index.openCursor(IDBKeyRange.only(ownerUid));
 
-    req.onsuccess = () => resolve(true);
+    req.onsuccess = (event) => {
+      const cursor = event.target.result;
+      if (cursor) {
+        const val = cursor.value;
+        if (val._id === recordId || val.id === recordId) {
+          cursor.delete();
+          resolve(true);
+          return;
+        }
+        cursor.continue();
+      } else {
+        resolve(false);
+      }
+    };
     req.onerror = () => reject(req.error);
   });
 }
 
 /**
- * Clears only the active account's records on this device.
+ * Purges only expired records (>30 days) for ownerUid.
+ * Preserves fresh records (<=30 days) and other accounts' data.
+ */
+export async function cleanExpiredLocalRecords(ownerUid, retentionDays = 30) {
+  if (!ownerUid) return 0;
+  const db = await openDatabase();
+  const now = new Date();
+  const cutoff = new Date(now.getTime() - retentionDays * 24 * 60 * 60 * 1000);
+
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    const store = tx.objectStore(STORE_NAME);
+    const index = store.index('ownerUid');
+    const req = index.openCursor(IDBKeyRange.only(ownerUid));
+    let deletedCount = 0;
+
+    req.onsuccess = (event) => {
+      const cursor = event.target.result;
+      if (cursor) {
+        const record = cursor.value;
+        let isExpired = false;
+        if (record.expiresAt) {
+          isExpired = new Date(record.expiresAt) <= now;
+        } else if (record.createdAt) {
+          isExpired = new Date(record.createdAt) <= cutoff;
+        }
+        if (isExpired) {
+          cursor.delete();
+          deletedCount++;
+        }
+        cursor.continue();
+      } else {
+        resolve(deletedCount);
+      }
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+/**
+ * Clears only the active account's records if user specifically requests a full purge.
  * Leaves all other accounts' data intact in IndexedDB.
  */
-export async function clearLocalRecordsForUser(ownerUid, deviceId) {
-  if (!ownerUid || !deviceId) return 0;
+export async function clearLocalRecordsForUser(ownerUid) {
+  if (!ownerUid) return 0;
   const db = await openDatabase();
-  const partitionKey = buildPartitionKey(ownerUid, deviceId);
 
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, 'readwrite');
     const store = tx.objectStore(STORE_NAME);
-    const index = store.index('partitionKey');
-    const req = index.openCursor(IDBKeyRange.only(partitionKey));
+    const index = store.index('ownerUid');
+    const req = index.openCursor(IDBKeyRange.only(ownerUid));
     let count = 0;
 
     req.onsuccess = (event) => {

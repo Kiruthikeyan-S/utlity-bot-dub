@@ -1,7 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { X, Trash2, FileText, Search, RefreshCw, ChevronRight, Clock, HardDrive, AlertCircle, Image as ImageIcon } from 'lucide-react';
 import { getHistoryApi, deleteHistoryApi, getStorageStatsApi, cleanStorageApi, getDeviceId } from '../services/api';
-import { getLocalRecords, saveLocalRecord, deleteLocalRecord, clearLocalRecordsForUser } from '../services/localStore';
+import { getLocalRecords, saveLocalRecord, deleteLocalRecord, cleanExpiredLocalRecords } from '../services/localStore';
 
 export default function HistoryDrawer({ isOpen, onClose, onSelectDocument, currentUser }) {
   const [history, setHistory] = useState([]);
@@ -10,31 +10,44 @@ export default function HistoryDrawer({ isOpen, onClose, onSelectDocument, curre
   const [isCleaning, setIsCleaning] = useState(false);
   const [search, setSearch] = useState('');
   const [typeFilter, setTypeFilter] = useState('');
+  const activeRequestUidRef = useRef(null);
 
   // Clear displayed history immediately when account switches
   useEffect(() => {
+    activeRequestUidRef.current = currentUser?.uid || null;
     setHistory([]);
     setStats(null);
   }, [currentUser?.uid]);
 
   const fetchHistoryAndStats = async () => {
-    setIsLoading(true);
     const ownerUid = currentUser?.uid;
+    if (!ownerUid) {
+      setHistory([]);
+      setStats(null);
+      setIsLoading(false);
+      return;
+    }
+
+    activeRequestUidRef.current = ownerUid;
+    setIsLoading(true);
     const deviceId = getDeviceId();
 
     try {
       const [historyData, statsData, localRecords] = await Promise.all([
         getHistoryApi({ limit: 50, doc_type: typeFilter || undefined }).catch(() => ({ documents: [] })),
         getStorageStatsApi().catch(() => null),
-        ownerUid ? getLocalRecords(ownerUid, deviceId).catch(() => []) : Promise.resolve([]),
+        getLocalRecords(ownerUid).catch(() => []),
       ]);
+
+      // If user switched while requests were in-flight, discard stale responses immediately
+      if (activeRequestUidRef.current !== ownerUid) {
+        return;
+      }
 
       const remoteDocs = historyData?.documents || [];
       // Cache remote documents into IndexedDB partition for offline retrieval
-      if (ownerUid) {
-        for (const doc of remoteDocs) {
-          saveLocalRecord(doc, ownerUid, deviceId).catch(() => {});
-        }
+      for (const doc of remoteDocs) {
+        saveLocalRecord(doc, ownerUid, deviceId).catch(() => {});
       }
 
       // Merge remote documents and local records, deduplicating by ID
@@ -57,12 +70,14 @@ export default function HistoryDrawer({ isOpen, onClose, onSelectDocument, curre
     } catch (e) {
       console.error('Failed to fetch history:', e);
     } finally {
-      setIsLoading(false);
+      if (activeRequestUidRef.current === ownerUid) {
+        setIsLoading(false);
+      }
     }
   };
 
   useEffect(() => {
-    if (isOpen) {
+    if (isOpen && currentUser?.uid) {
       fetchHistoryAndStats();
     }
   }, [isOpen, typeFilter, currentUser?.uid]);
@@ -73,7 +88,7 @@ export default function HistoryDrawer({ isOpen, onClose, onSelectDocument, curre
     try {
       await deleteHistoryApi(id);
       if (currentUser?.uid) {
-        await deleteLocalRecord(id, currentUser.uid, getDeviceId());
+        await deleteLocalRecord(id, currentUser.uid);
       }
       setHistory((prev) => prev.filter((d) => d._id !== id));
       getStorageStatsApi().then(setStats).catch(() => {});
@@ -83,14 +98,17 @@ export default function HistoryDrawer({ isOpen, onClose, onSelectDocument, curre
   };
 
   const handleCleanStorage = async () => {
-    if (!window.confirm('Purge expired records (>30 days) from storage?')) return;
+    if (!window.confirm('Purge expired records (>30 days) from storage? Fresh records will be preserved.')) return;
     setIsCleaning(true);
     try {
-      await cleanStorageApi(false);
+      const res = await cleanStorageApi(false);
       if (currentUser?.uid) {
-        await clearLocalRecordsForUser(currentUser.uid, getDeviceId());
+        await cleanExpiredLocalRecords(currentUser.uid, 30);
       }
       await fetchHistoryAndStats();
+      if (res?.message) {
+        alert(res.message);
+      }
     } catch (e) {
       alert('Failed to clean storage.');
     } finally {

@@ -85,6 +85,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"YOLO Face warmup warning: {e}")
 
+    try:
+        from storage import ensure_database_indexes
+        ensure_database_indexes()
+    except Exception as e:
+        logger.warning(f"Database indexes warning: {e}")
+
     yield
 
 
@@ -107,17 +113,20 @@ app.add_middleware(
 
 @app.get("/health")
 def health_check():
-    """Health check endpoint reporting OCR & database status."""
+    """Health check endpoint reporting OCR & real database status."""
     ocr_available, ocr_msg = check_tesseract_available()
-    from storage import MONGODB_URI
+    from storage import check_database_health, MONGODB_URI
+    db_health = check_database_health()
     return {
-        "status": "healthy",
+        "status": "healthy" if db_health.get("connected") else "degraded",
         "service": "utility_bot_backend",
         "ocr_engine": "RapidOCR (ONNX)",
         "ocr_available": ocr_available,
         "ocr_message": ocr_msg,
-        "database_connected": True,
-        "database_type": "MongoDB Atlas" if MONGODB_URI else "Local Store (history.json)",
+        "database_connected": db_health.get("connected", False),
+        "database_type": db_health.get("database_type", "Unknown"),
+        "database_latency_ms": db_health.get("latency_ms"),
+        "database_error": db_health.get("error"),
         "mongodb_configured": bool(MONGODB_URI),
         "tesseract_available": ocr_available,
         "tesseract_message": ocr_msg
@@ -139,10 +148,8 @@ def list_history(
     x_device_id: Optional[str] = Header(None, alias="X-Device-Id"),
     user: Dict[str, Any] = Depends(get_current_user)
 ):
-    """Retrieves verified SUCCESS verification records ('IMG...' series) strictly for authenticated user and active device."""
+    """Retrieves verified SUCCESS verification records ('IMG...' series) strictly for authenticated user."""
     active_device = x_device_id or deviceId
-    if not active_device:
-        raise HTTPException(status_code=400, detail="Missing X-Device-Id header.")
     return get_history(limit=limit, page=page, doc_type=doc_type, device_id=active_device, owner_uid=user["uid"])
 
 
@@ -154,10 +161,8 @@ def list_failed_history(
     x_device_id: Optional[str] = Header(None, alias="X-Device-Id"),
     user: Dict[str, Any] = Depends(get_current_user)
 ):
-    """Retrieves FAILED verification audit records ('FAIL...' series) strictly for authenticated user and active device."""
+    """Retrieves FAILED verification audit records ('FAIL...' series) strictly for authenticated user."""
     active_device = x_device_id or deviceId
-    if not active_device:
-        raise HTTPException(status_code=400, detail="Missing X-Device-Id header.")
     return get_failed_history(limit=limit, page=page, device_id=active_device, owner_uid=user["uid"])
 
 
@@ -269,17 +274,27 @@ def confirm_verification_decision(
 
 
 @app.get("/reference/{ref_id}")
-def get_public_reference_card(ref_id: str):
+def get_public_reference_card(ref_id: str, token: Optional[str] = None):
     """
     Public QR Verification Endpoint.
     Returns ONLY privacy-safe masked data.
-    Never exposes raw unmasked numbers, OCR text, or full document image.
+    Never exposes raw unmasked numbers, OCR text, owner UID, or internal database IDs.
     """
-    from reference_service import get_reference_by_id
+    import secrets
+    from reference_service import get_reference_by_id, get_public_reference_card_view
     rec = get_reference_by_id(ref_id)
     if not rec:
         raise HTTPException(status_code=404, detail="Identity Reference Card not found.")
-    return rec
+
+    if rec.get("revoked"):
+        raise HTTPException(status_code=410, detail="This Identity Reference Card has been revoked.")
+
+    expected_token = rec.get("qr_token")
+    if expected_token and token:
+        if not secrets.compare_digest(expected_token, token):
+            raise HTTPException(status_code=403, detail="Invalid reference verification token.")
+
+    return get_public_reference_card_view(rec)
 
 
 @app.post("/reference/{ref_id}/revoke")
