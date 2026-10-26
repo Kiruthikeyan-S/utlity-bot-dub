@@ -10,6 +10,9 @@ import ShippingScanner from './components/ShippingScanner';
 import QRTools from './components/QRTools';
 import HomePage from './components/HomePage';
 import SettingsPanel from './components/SettingsPanel';
+import AuthModal from './components/AuthModal';
+import LoginPage from './components/LoginPage';
+import { subscribeToAuthChanges, logoutUser } from './firebase';
 import { extractDocumentApi, getHealthApi } from './services/api';
 import { ScanText, Eye, FileText, Code, AlertCircle, Loader2, ArrowRight, X, Bot, ShieldCheck, Package } from 'lucide-react';
 
@@ -39,6 +42,17 @@ export default function App() {
   const [activeTab, setActiveTab] = useState('fields');
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [isDbConnected, setIsDbConnected] = useState(false);
+  const [currentUser, setCurrentUser] = useState(null);
+  const [isAuthChecking, setIsAuthChecking] = useState(true);
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
+
+  useEffect(() => {
+    const unsubscribe = subscribeToAuthChanges((user) => {
+      setCurrentUser(user);
+      setIsAuthChecking(false);
+    });
+    return () => unsubscribe();
+  }, []);
 
   useEffect(() => {
     getHealthApi()
@@ -98,6 +112,26 @@ export default function App() {
     setErrorMessage(null);
   };
 
+  // 1. Initial Auth Loading State
+  if (isAuthChecking) {
+    return (
+      <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-center space-y-4">
+        <div className="w-12 h-12 rounded-2xl bg-gradient-to-tr from-sky-500 to-indigo-600 flex items-center justify-center text-white shadow-lg animate-pulse">
+          <Bot className="w-7 h-7" />
+        </div>
+        <div className="flex items-center space-x-2 text-slate-300 text-xs">
+          <Loader2 className="w-4 h-4 animate-spin text-sky-400" />
+          <span>Verifying secure session...</span>
+        </div>
+      </div>
+    );
+  }
+
+  // 2. Authentication Gatekeeper: User must log in first to access any tools
+  if (!currentUser) {
+    return <LoginPage />;
+  }
+
   return (
     <div className="min-h-screen flex flex-col bg-slate-50 text-slate-900">
       
@@ -108,6 +142,11 @@ export default function App() {
         isConnected={isDbConnected}
         activePage={currentPage}
         onNavigate={(page) => setCurrentPage(page)}
+        user={currentUser}
+        onOpenAuth={() => setIsAuthModalOpen(true)}
+        onLogout={async () => {
+          await logoutUser();
+        }}
       />
 
       {/* Slide-out Sidebar Drawer */}
@@ -300,6 +339,12 @@ export default function App() {
           setExtractionResult(doc);
           setActiveTab('fields');
         }}
+      />
+
+      {/* Firebase Authentication Modal */}
+      <AuthModal
+        isOpen={isAuthModalOpen}
+        onClose={() => setIsAuthModalOpen(false)}
       />
 
       {/* Settings Modal */}

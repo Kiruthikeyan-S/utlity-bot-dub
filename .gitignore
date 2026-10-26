@@ -8,6 +8,7 @@ python_service/__pycache__/
 # Environment & Secrets
 .env
 python_service/.env
+client/.env
 *.env.local
 
 # Build Outputs

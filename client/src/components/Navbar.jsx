@@ -1,7 +1,16 @@
 import React from 'react';
-import { Bot, History, Clock } from 'lucide-react';
+import { Bot, History, Clock, LogIn, LogOut, User as UserIcon } from 'lucide-react';
 
-export default function Navbar({ onToggleSidebar, onToggleHistory, isConnected, activePage = 'home', onNavigate }) {
+export default function Navbar({
+  onToggleSidebar,
+  onToggleHistory,
+  isConnected,
+  activePage = 'home',
+  onNavigate,
+  user = null,
+  onOpenAuth,
+  onLogout
+}) {
   const getPageInfo = () => {
     switch (activePage) {
       case 'home':
@@ -98,6 +107,44 @@ export default function Navbar({ onToggleSidebar, onToggleHistory, isConnected, 
             <span className="hidden sm:inline">Applicant History</span>
             <span className="sm:hidden">History</span>
           </button>
+
+          {/* Firebase Authentication Button / Profile Badge */}
+          {user ? (
+            <div className="flex items-center space-x-1.5 pl-2 border-l border-slate-200">
+              <div className="flex items-center space-x-2 bg-slate-50 border border-slate-200/90 rounded-full pl-1 pr-3 py-1 shadow-xs">
+                {user.photoURL ? (
+                  <img
+                    src={user.photoURL}
+                    alt={user.displayName || 'User'}
+                    className="w-6 h-6 rounded-full object-cover border border-slate-200"
+                    referrerPolicy="no-referrer"
+                  />
+                ) : (
+                  <div className="w-6 h-6 rounded-full bg-gradient-to-tr from-sky-600 to-indigo-600 text-white text-[11px] font-bold flex items-center justify-center">
+                    {(user.displayName || user.email || 'U')[0].toUpperCase()}
+                  </div>
+                )}
+                <span className="text-xs font-semibold text-slate-800 max-w-[120px] truncate hidden sm:inline">
+                  {user.displayName || user.email?.split('@')[0]}
+                </span>
+              </div>
+              <button
+                onClick={onLogout}
+                title="Sign Out"
+                className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-xl transition cursor-pointer"
+              >
+                <LogOut className="w-4 h-4" />
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={onOpenAuth}
+              className="flex items-center space-x-1.5 px-3.5 py-1.5 rounded-xl bg-gradient-to-r from-sky-600 to-indigo-600 hover:from-sky-700 hover:to-indigo-700 text-white transition text-xs font-semibold shadow-sm shadow-indigo-500/20 active:scale-95 cursor-pointer"
+            >
+              <LogIn className="w-3.5 h-3.5" />
+              <span>Sign In</span>
+            </button>
+          )}
         </div>
 
       </div>
