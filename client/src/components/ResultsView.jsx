@@ -27,7 +27,9 @@ import {
   ArrowLeft, 
   Edit3 
 } from 'lucide-react';
-import { confirmVerificationApi } from '../services/api';
+import { confirmVerificationApi, getDeviceId } from '../services/api';
+import { saveLocalRecord } from '../services/localStore';
+import { auth } from '../firebase';
 import IdentityReferenceCard from './IdentityReferenceCard';
 import LiveFaceVerificationModal from './LiveFaceVerificationModal';
 import SecondIdVerificationModal from './SecondIdVerificationModal';
@@ -109,6 +111,11 @@ export default function ResultsView({ result, onUploadAnother, onRetryScan, isRe
       setConfirmationStatus('Success');
       if (response.reference_card) {
         setReferenceCardData(response.reference_card);
+      }
+      
+      // Save locally to IndexedDB partitioned by active user & device
+      if (auth.currentUser && response.record) {
+        saveLocalRecord(response.record, auth.currentUser.uid, getDeviceId()).catch(() => {});
       }
       
       // Move to Customer Identity Verification stage

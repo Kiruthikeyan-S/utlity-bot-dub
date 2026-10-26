@@ -1,75 +1,21 @@
 import axios from 'axios';
+import { auth, logoutUser } from '../firebase';
 
 // Connect directly to Python FastAPI backend (auto-adapts to unified domain in production)
 const API_BASE = import.meta.env.VITE_API_URL || (import.meta.env.DEV ? 'http://localhost:8000' : (typeof window !== 'undefined' ? window.location.origin : ''));
 
 /**
- * Generates a deterministic, REAL Hardware & Browser Fingerprint for this physical device.
- * Based on CPU cores, GPU canvas rendering hash, screen resolution, and OS architecture.
- * This ID is stable and permanently tied to this real physical computer.
- */
-export const getRealHardwareFingerprint = () => {
-  try {
-    const nav = window.navigator || {};
-    const scr = window.screen || {};
-    
-    // 1. Gather hardware & environment parameters
-    const hardwareProps = [
-      nav.userAgent || '',
-      nav.platform || '',
-      nav.hardwareConcurrency || 4, // CPU Cores
-      nav.language || '',
-      Intl.DateTimeFormat().resolvedOptions().timeZone || '',
-      `${scr.width}x${scr.height}x${scr.colorDepth || 24}`,
-      window.devicePixelRatio || 1
-    ];
-
-    // 2. Compute Canvas GPU Shader Fingerprint
-    const canvas = document.createElement('canvas');
-    canvas.width = 200;
-    canvas.height = 50;
-    const ctx = canvas.getContext('2d');
-    if (ctx) {
-      ctx.textBaseline = 'top';
-      ctx.font = "14px 'Arial'";
-      ctx.textBaseline = 'alphabetic';
-      ctx.fillStyle = '#f60';
-      ctx.fillRect(125, 1, 62, 20);
-      ctx.fillStyle = '#069';
-      ctx.fillText('UtilityBot_Device_Fingerprint_2026', 2, 15);
-      ctx.fillStyle = 'rgba(102, 204, 0, 0.7)';
-      ctx.fillText('UtilityBot_Device_Fingerprint_2026', 4, 17);
-      hardwareProps.push(canvas.toDataURL());
-    }
-
-    // 3. Generate deterministic 32-bit Hash
-    const rawString = hardwareProps.join('###');
-    let hash = 0;
-    for (let i = 0; i < rawString.length; i++) {
-      const char = rawString.charCodeAt(i);
-      hash = ((hash << 5) - hash) + char;
-      hash |= 0; // Convert to 32bit integer
-    }
-
-    const hexHash = Math.abs(hash).toString(16).padStart(8, '0');
-    const osTag = (nav.platform || 'pc').toLowerCase().replace(/[^a-z0-9]/g, '');
-    const cores = nav.hardwareConcurrency || 4;
-    
-    return `device_${osTag}_${cores}core_${hexHash}`;
-  } catch (err) {
-    return 'device_workstation_primary';
-  }
-};
-
-/**
- * Returns the fixed Real Device ID for this machine.
- * Persistently stored in localStorage so it remains constant across all sessions.
+ * Returns a unique random UUID for this browser profile.
+ * Persistently stored in localStorage so it remains constant across all sessions in this browser.
+ * Replaces hardcoded default device IDs and hardware fingerprinting.
  */
 export const getDeviceId = () => {
+  if (typeof window === 'undefined') return 'server_session';
   let deviceId = localStorage.getItem('utility_bot_device_id');
-  if (!deviceId) {
-    // Fixed default device ID as requested: dev_mtcqjgy8_gr4nils (or hardware fingerprint)
-    deviceId = 'dev_mtcqjgy8_gr4nils';
+  if (!deviceId || deviceId === 'dev_mtcqjgy8_gr4nils' || deviceId.startsWith('device_')) {
+    deviceId = (typeof crypto !== 'undefined' && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : 'dev_' + Math.random().toString(36).substring(2, 15) + '_' + Date.now().toString(36);
     localStorage.setItem('utility_bot_device_id', deviceId);
   }
   return deviceId;
@@ -92,12 +38,48 @@ export const api = axios.create({
   timeout: 120000,
 });
 
-// Attach Device ID to EVERY outgoing request for strict user data privacy
-api.interceptors.request.use((config) => {
+// Request Interceptor: Attach Device ID AND fresh Firebase ID token to EVERY outgoing request
+api.interceptors.request.use(async (config) => {
+  config.headers = config.headers || {};
   const deviceId = getDeviceId();
   config.headers['X-Device-Id'] = deviceId;
+
+  // Retrieve current Firebase user and attach fresh ID token (never user-supplied UID)
+  try {
+    const currentUser = auth.currentUser;
+    if (currentUser) {
+      const token = await currentUser.getIdToken();
+      if (token) {
+        config.headers.Authorization = `Bearer ${token}`;
+      }
+    }
+  } catch (authErr) {
+    console.warn('[API Interceptor] Could not fetch ID token:', authErr);
+  }
+
   return config;
+}, (error) => {
+  return Promise.reject(error);
 });
+
+// Response Interceptor: Handle HTTP 401 Unauthorized responses and expired sessions
+api.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    if (error.response && error.response.status === 401) {
+      console.warn('[API Interceptor] 401 Unauthorized - session expired or invalid credentials.');
+      try {
+        await logoutUser();
+      } catch (logoutErr) {
+        // ignore
+      }
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('utilitybot:unauthorized'));
+      }
+    }
+    return Promise.reject(error);
+  }
+);
 
 /**
  * Uploads ID document image directly to Python FastAPI backend.

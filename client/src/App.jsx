@@ -47,11 +47,34 @@ export default function App() {
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
 
   useEffect(() => {
+    let prevUid = null;
     const unsubscribe = subscribeToAuthChanges((user) => {
+      const nextUid = user ? user.uid : null;
+      if (prevUid !== null && prevUid !== nextUid) {
+        // Account switched or logged out: clear all visible extracted state & cache
+        setSelectedFile(null);
+        setExtractionResult(null);
+        setErrorMessage(null);
+        setActiveTab('fields');
+        setIsHistoryOpen(false);
+      }
+      prevUid = nextUid;
       setCurrentUser(user);
       setIsAuthChecking(false);
     });
-    return () => unsubscribe();
+
+    const handleUnauthorized = () => {
+      setSelectedFile(null);
+      setExtractionResult(null);
+      setErrorMessage(null);
+      setCurrentUser(null);
+    };
+    window.addEventListener('utilitybot:unauthorized', handleUnauthorized);
+
+    return () => {
+      unsubscribe();
+      window.removeEventListener('utilitybot:unauthorized', handleUnauthorized);
+    };
   }, []);
 
   useEffect(() => {
@@ -334,6 +357,7 @@ export default function App() {
       <HistoryDrawer
         isOpen={isHistoryOpen}
         onClose={() => setIsHistoryOpen(false)}
+        currentUser={currentUser}
         onSelectDocument={(doc) => {
           setCurrentPage('id_verification');
           setExtractionResult(doc);

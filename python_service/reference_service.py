@@ -1,7 +1,7 @@
 """
 reference_service.py - Privacy-Safe Identity Reference Card Service.
 Generates unguessable Reference IDs, masks sensitive document numbers,
-generates secure QR tokens, and manages reference card records and revocation.
+generates secure QR tokens, and manages reference card records, ownership, and revocation.
 """
 
 import os
@@ -10,8 +10,11 @@ import secrets
 import qrcode
 import io
 import base64
+import logging
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
+
+logger = logging.getLogger("utility_bot.reference")
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 REFERENCES_FILE = os.path.join(DATA_DIR, "references.json")
@@ -95,8 +98,7 @@ def generate_reference_id(doc_type: str) -> str:
     else:
         prefix = "DOC"
 
-    # Secure random 6-character alphanumeric token
-    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789" # avoid easily confused chars (I, 1, O, 0)
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     token = "".join(secrets.choice(alphabet) for _ in range(6))
     return f"{prefix}-KYC-{token}"
 
@@ -143,7 +145,7 @@ def write_reference_records(records: List[Dict[str, Any]]) -> None:
                 json.dump(records, f, indent=2)
                 f.write("\n")
     except Exception as e:
-        print(f"[ReferenceService] Error writing references: {e}")
+        logger.error(f"Error writing references: {e}")
 
 
 def create_identity_reference(
@@ -151,10 +153,11 @@ def create_identity_reference(
     document_type: str,
     extracted_data: Dict[str, Any],
     portrait_photo: Optional[str] = None,
-    device_id: Optional[str] = None
+    device_id: Optional[str] = None,
+    owner_uid: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Creates a privacy-safe Identity Reference Record linked to the internal verification ID.
+    Creates a privacy-safe Identity Reference Record linked to the internal verification ID and owner_uid.
     Original ID document image, full number, raw OCR text, and private addresses are OMITTED.
     """
     ref_id = generate_reference_id(document_type)
@@ -170,7 +173,6 @@ def create_identity_reference(
 
     now = datetime.now(timezone.utc).isoformat()
     
-    # Doc type display name
     doc_display_names = {
         "aadhaar": "Aadhaar",
         "aadhaar_back": "Aadhaar",
@@ -181,19 +183,18 @@ def create_identity_reference(
     }
     doc_display = doc_display_names.get(document_type, document_type.replace("_", " ").title())
 
-    # Generate QR Code image (base64)
     qr_code_image = generate_qr_code_base64(ref_id, qr_token)
 
-    # Privacy-Safe Public Reference Record
     reference_record = {
         "reference_id": ref_id,
         "verification_id": verification_id,
         "qr_token": qr_token,
+        "owner_uid": owner_uid,
         "document_type": document_type,
         "document_type_display": doc_display,
         "name": applicant_name,
         "masked_number": masked_number,
-        "photo": portrait_photo,  # Cropped face portrait ONLY, NOT the raw document image
+        "photo": portrait_photo,
         "verification_status": "DETAILS CONFIRMED",
         "created_at": now,
         "revoked": False,
@@ -213,26 +214,55 @@ def create_identity_reference(
         from storage import sync_record_to_mongodb
         sync_record_to_mongodb("identity_references", ref_id, reference_record)
     except Exception as err:
-        print(f"[ReferenceService] MongoDB sync notice: {err}")
+        logger.warning(f"MongoDB reference sync notice: {err}")
 
     return reference_record
 
 
 def get_reference_by_id(ref_id: str) -> Optional[Dict[str, Any]]:
-    """Retrieves a reference card by its privacy Reference ID."""
+    """
+    Retrieves a reference card by its privacy Reference ID.
+    Intentionally PUBLIC for third-party verification, returning only masked, privacy-safe data.
+    """
     records = read_reference_records()
     for rec in records:
         if rec.get("reference_id") == ref_id:
             return rec
+
+    # Check MongoDB Atlas if available
+    try:
+        from storage import get_mongo_client, MONGODB_DB_NAME
+        client = get_mongo_client()
+        if client:
+            db = client[MONGODB_DB_NAME]
+            doc = db["identity_references"].find_one({"reference_id": ref_id})
+            if doc:
+                return doc
+    except Exception:
+        pass
+
     return None
 
 
-def revoke_reference_by_id(ref_id: str) -> bool:
-    """Revokes an existing Reference ID so it can no longer be used for verification."""
+def revoke_reference_by_id(
+    ref_id: str, 
+    owner_uid: Optional[str] = None, 
+    device_id: Optional[str] = None
+) -> bool:
+    """
+    Revokes an existing Reference ID so it can no longer be used for verification.
+    STRICTLY verifies that the requesting user is the owner (owner_uid).
+    """
+    if not owner_uid:
+        return False
+
     records = read_reference_records()
     found = False
     for rec in records:
         if rec.get("reference_id") == ref_id:
+            # Check owner
+            if rec.get("owner_uid") != owner_uid:
+                return False
             rec["revoked"] = True
             rec["revoked_at"] = datetime.now(timezone.utc).isoformat()
             rec["verification_status"] = "REVOKED"
@@ -242,19 +272,21 @@ def revoke_reference_by_id(ref_id: str) -> bool:
     if found:
         write_reference_records(records)
         try:
-            from storage import IS_MONGO_ONLINE, _atlas_request
-            if IS_MONGO_ONLINE:
-                _atlas_request("updateOne", "identity_references", {
-                    "filter": {"reference_id": ref_id},
-                    "update": {
+            from storage import get_mongo_client, MONGODB_DB_NAME
+            client = get_mongo_client()
+            if client:
+                db = client[MONGODB_DB_NAME]
+                db["identity_references"].update_one(
+                    {"reference_id": ref_id, "owner_uid": owner_uid},
+                    {
                         "$set": {
                             "revoked": True, 
                             "verification_status": "REVOKED",
                             "revoked_at": datetime.now(timezone.utc).isoformat()
                         }
                     }
-                })
-        except Exception:
-            pass
+                )
+        except Exception as e:
+            logger.warning(f"Failed to sync reference revocation to MongoDB: {e}")
         return True
     return False

@@ -19,7 +19,7 @@ except Exception:
     pass
 
 from typing import Optional, Dict, Any, List
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Header
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -27,6 +27,8 @@ from PIL import Image
 from dotenv import load_dotenv
 
 load_dotenv()
+
+from auth import get_current_user, get_optional_user
 
 from shipping_schemas import ShippingLabelResult, CodeItem
 from shipping_extractor import extract_shipping_label_data, extract_shipping_info_llm
@@ -134,11 +136,14 @@ def list_history(
     page: int = 1, 
     doc_type: Optional[str] = None,
     deviceId: Optional[str] = None,
-    x_device_id: Optional[str] = Header(None, alias="X-Device-Id")
+    x_device_id: Optional[str] = Header(None, alias="X-Device-Id"),
+    user: Dict[str, Any] = Depends(get_current_user)
 ):
-    """Retrieves verified SUCCESS verification records ('IMG...' series) strictly for the public History drawer."""
+    """Retrieves verified SUCCESS verification records ('IMG...' series) strictly for authenticated user and active device."""
     active_device = x_device_id or deviceId
-    return get_history(limit=limit, page=page, doc_type=doc_type, device_id=active_device)
+    if not active_device:
+        raise HTTPException(status_code=400, detail="Missing X-Device-Id header.")
+    return get_history(limit=limit, page=page, doc_type=doc_type, device_id=active_device, owner_uid=user["uid"])
 
 
 @app.get("/failed-history")
@@ -146,24 +151,28 @@ def list_failed_history(
     limit: int = 50,
     page: int = 1,
     deviceId: Optional[str] = None,
-    x_device_id: Optional[str] = Header(None, alias="X-Device-Id")
+    x_device_id: Optional[str] = Header(None, alias="X-Device-Id"),
+    user: Dict[str, Any] = Depends(get_current_user)
 ):
-    """Retrieves FAILED verification audit records ('FAIL...' series) strictly hidden from public history."""
+    """Retrieves FAILED verification audit records ('FAIL...' series) strictly for authenticated user and active device."""
     active_device = x_device_id or deviceId
-    return get_failed_history(limit=limit, page=page, device_id=active_device)
+    if not active_device:
+        raise HTTPException(status_code=400, detail="Missing X-Device-Id header.")
+    return get_failed_history(limit=limit, page=page, device_id=active_device, owner_uid=user["uid"])
 
 
 @app.get("/history/{doc_id}")
 def retrieve_extraction(
     doc_id: str,
     deviceId: Optional[str] = None,
-    x_device_id: Optional[str] = Header(None, alias="X-Device-Id")
+    x_device_id: Optional[str] = Header(None, alias="X-Device-Id"),
+    user: Dict[str, Any] = Depends(get_current_user)
 ):
-    """Retrieves a single verification record by ID."""
+    """Retrieves a single verification record strictly verifying owner_uid and active device."""
     active_device = x_device_id or deviceId
-    record = get_extraction_by_id(doc_id, device_id=active_device)
+    record = get_extraction_by_id(doc_id, device_id=active_device, owner_uid=user["uid"])
     if not record:
-        raise HTTPException(status_code=404, detail="Document verification record not found or inaccessible for this device.")
+        raise HTTPException(status_code=404, detail="Document verification record not found or inaccessible for this account and device.")
     return record
 
 
@@ -171,11 +180,12 @@ def retrieve_extraction(
 def remove_extraction(
     doc_id: str,
     deviceId: Optional[str] = None,
-    x_device_id: Optional[str] = Header(None, alias="X-Device-Id")
+    x_device_id: Optional[str] = Header(None, alias="X-Device-Id"),
+    user: Dict[str, Any] = Depends(get_current_user)
 ):
-    """Deletes a verification record by ID."""
+    """Deletes a verification record strictly verifying owner_uid and active device."""
     active_device = x_device_id or deviceId
-    success = delete_extraction_by_id(doc_id, device_id=active_device)
+    success = delete_extraction_by_id(doc_id, device_id=active_device, owner_uid=user["uid"])
     if not success:
         raise HTTPException(status_code=404, detail="Document not found or permission denied.")
     return {"message": "Document deleted successfully."}
@@ -184,35 +194,41 @@ def remove_extraction(
 @app.get("/storage/stats")
 def storage_usage_stats(
     deviceId: Optional[str] = None,
-    x_device_id: Optional[str] = Header(None, alias="X-Device-Id")
+    x_device_id: Optional[str] = Header(None, alias="X-Device-Id"),
+    user: Dict[str, Any] = Depends(get_current_user)
 ):
-    """Returns storage usage statistics."""
+    """Returns storage usage statistics for authenticated user and active device."""
     active_device = x_device_id or deviceId
-    return get_storage_stats(device_id=active_device)
+    return get_storage_stats(device_id=active_device, owner_uid=user["uid"])
 
 
 @app.post("/storage/clean")
 def trigger_storage_cleanup(
     force_all: bool = False,
     deviceId: Optional[str] = None,
-    x_device_id: Optional[str] = Header(None, alias="X-Device-Id")
+    x_device_id: Optional[str] = Header(None, alias="X-Device-Id"),
+    user: Dict[str, Any] = Depends(get_current_user)
 ):
-    """Cleans expired records or purges verification storage."""
+    """Cleans expired records or purges storage strictly for authenticated user and active device."""
     active_device = x_device_id or deviceId
-    return clean_storage(device_id=active_device, force_all=force_all)
+    return clean_storage(device_id=active_device, owner_uid=user["uid"], force_all=force_all)
 
 
 @app.post("/confirm")
 def confirm_verification_decision(
     payload: ConfirmationRequest,
-    x_device_id: Optional[str] = Header(None, alias="X-Device-Id")
+    x_device_id: Optional[str] = Header(None, alias="X-Device-Id"),
+    user: Dict[str, Any] = Depends(get_current_user)
 ):
     """
     Human-in-the-Loop Confirmation Gateway endpoint:
-    - 'correct': Assigns sequential ID 'IMG000001', saves internal record, and generates privacy Identity Reference Card.
-    - 'wrong': Assigns sequential ID 'FAIL000001', records audit failure (no reference card created).
+    - 'correct': Assigns sequential ID 'IMG000001', binds to owner_uid and deviceId, saves record and creates reference card.
+    - 'wrong': Assigns sequential ID 'FAIL000001', records audit failure bound to owner_uid and deviceId.
     """
-    active_device = x_device_id or payload.deviceId or "default_client"
+    active_device = x_device_id or payload.deviceId
+    if not active_device:
+        raise HTTPException(status_code=400, detail="Missing X-Device-Id header.")
+    owner_uid = user["uid"]
     res = save_confirmed_verification(
         result_dict=payload.model_dump() if hasattr(payload, "model_dump") else payload.dict(),
         action=payload.action,
@@ -220,7 +236,8 @@ def confirm_verification_decision(
         original_filename=payload.original_filename or "document.jpg",
         thumbnail_image=payload.thumbnail_image,
         portrait_photo=payload.portrait_photo,
-        device_id=active_device
+        device_id=active_device,
+        owner_uid=owner_uid
     )
 
     # Privacy-Safe Reference Card Generation on User Confirmation
@@ -238,7 +255,8 @@ def confirm_verification_decision(
                 document_type=payload.document_type,
                 extracted_data=clean_data,
                 portrait_photo=payload.portrait_photo,
-                device_id=active_device
+                device_id=active_device,
+                owner_uid=owner_uid
             )
             res["reference_card"] = ref_record
         except Exception as ref_err:
@@ -265,14 +283,21 @@ def get_public_reference_card(ref_id: str):
 
 
 @app.post("/reference/{ref_id}/revoke")
-def revoke_public_reference_card(ref_id: str):
+def revoke_public_reference_card(
+    ref_id: str,
+    deviceId: Optional[str] = None,
+    x_device_id: Optional[str] = Header(None, alias="X-Device-Id"),
+    user: Dict[str, Any] = Depends(get_current_user)
+):
     """
     Revokes an active Reference Card so it immediately becomes invalid.
+    STRICTLY verifies that requesting user owns the reference card.
     """
+    active_device = x_device_id or deviceId
     from reference_service import revoke_reference_by_id
-    success = revoke_reference_by_id(ref_id)
+    success = revoke_reference_by_id(ref_id, owner_uid=user["uid"], device_id=active_device)
     if not success:
-        raise HTTPException(status_code=404, detail="Reference card not found or already revoked.")
+        raise HTTPException(status_code=403, detail="Reference card not found or permission denied.")
     return {"message": f"Reference ID {ref_id} has been revoked successfully.", "status": "REVOKED"}
 
 
@@ -285,7 +310,8 @@ def get_liveness_challenge():
 @app.post("/verify/live-face")
 def verify_live_face(
     payload: LiveFaceVerificationRequest,
-    x_device_id: Optional[str] = Header(None, alias="X-Device-Id")
+    x_device_id: Optional[str] = Header(None, alias="X-Device-Id"),
+    user: Optional[Dict[str, Any]] = Depends(get_optional_user)
 ):
     """
     Live Camera Face & Liveness Verification Endpoint:
@@ -344,7 +370,8 @@ def verify_live_face(
 @app.post("/verify/second-id")
 def verify_second_id_crosscheck(
     payload: SecondIdVerificationRequest,
-    x_device_id: Optional[str] = Header(None, alias="X-Device-Id")
+    x_device_id: Optional[str] = Header(None, alias="X-Device-Id"),
+    user: Optional[Dict[str, Any]] = Depends(get_optional_user)
 ):
     """
     Cross-checks First ID data & portrait against a Second ID document (Aadhaar, PAN, DL).
@@ -379,7 +406,8 @@ async def extract_document(
     model_name: Optional[str] = Form(None),
     groq_api_key: Optional[str] = Form(None),
     deviceId: Optional[str] = Form(None),
-    x_device_id: Optional[str] = Header(None, alias="X-Device-Id")
+    x_device_id: Optional[str] = Header(None, alias="X-Device-Id"),
+    user: Optional[Dict[str, Any]] = Depends(get_optional_user)
 ):
     """
     Main extraction pipeline endpoint with Pre-LLM Decision Gate.

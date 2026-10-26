@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import { X, Trash2, FileText, Search, RefreshCw, ChevronRight, Clock, HardDrive, AlertCircle, Image as ImageIcon } from 'lucide-react';
-import { getHistoryApi, deleteHistoryApi, getStorageStatsApi, cleanStorageApi } from '../services/api';
+import { getHistoryApi, deleteHistoryApi, getStorageStatsApi, cleanStorageApi, getDeviceId } from '../services/api';
+import { getLocalRecords, saveLocalRecord, deleteLocalRecord, clearLocalRecordsForUser } from '../services/localStore';
 
-export default function HistoryDrawer({ isOpen, onClose, onSelectDocument }) {
+export default function HistoryDrawer({ isOpen, onClose, onSelectDocument, currentUser }) {
   const [history, setHistory] = useState([]);
   const [stats, setStats] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -10,14 +11,48 @@ export default function HistoryDrawer({ isOpen, onClose, onSelectDocument }) {
   const [search, setSearch] = useState('');
   const [typeFilter, setTypeFilter] = useState('');
 
+  // Clear displayed history immediately when account switches
+  useEffect(() => {
+    setHistory([]);
+    setStats(null);
+  }, [currentUser?.uid]);
+
   const fetchHistoryAndStats = async () => {
     setIsLoading(true);
+    const ownerUid = currentUser?.uid;
+    const deviceId = getDeviceId();
+
     try {
-      const [historyData, statsData] = await Promise.all([
-        getHistoryApi({ limit: 50, doc_type: typeFilter || undefined }),
-        getStorageStatsApi(),
+      const [historyData, statsData, localRecords] = await Promise.all([
+        getHistoryApi({ limit: 50, doc_type: typeFilter || undefined }).catch(() => ({ documents: [] })),
+        getStorageStatsApi().catch(() => null),
+        ownerUid ? getLocalRecords(ownerUid, deviceId).catch(() => []) : Promise.resolve([]),
       ]);
-      setHistory(historyData.documents || []);
+
+      const remoteDocs = historyData?.documents || [];
+      // Cache remote documents into IndexedDB partition for offline retrieval
+      if (ownerUid) {
+        for (const doc of remoteDocs) {
+          saveLocalRecord(doc, ownerUid, deviceId).catch(() => {});
+        }
+      }
+
+      // Merge remote documents and local records, deduplicating by ID
+      const map = new Map();
+      for (const doc of localRecords) {
+        if (doc._id) map.set(doc._id, doc);
+      }
+      for (const doc of remoteDocs) {
+        if (doc._id) map.set(doc._id, doc);
+      }
+
+      let combined = Array.from(map.values());
+      if (typeFilter) {
+        combined = combined.filter((d) => (d.documentType || d.document_type) === typeFilter);
+      }
+      combined.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+
+      setHistory(combined);
       setStats(statsData);
     } catch (e) {
       console.error('Failed to fetch history:', e);
@@ -30,13 +65,16 @@ export default function HistoryDrawer({ isOpen, onClose, onSelectDocument }) {
     if (isOpen) {
       fetchHistoryAndStats();
     }
-  }, [isOpen, typeFilter]);
+  }, [isOpen, typeFilter, currentUser?.uid]);
 
   const handleDelete = async (e, id) => {
     e.stopPropagation();
     if (!window.confirm('Delete this verification record?')) return;
     try {
       await deleteHistoryApi(id);
+      if (currentUser?.uid) {
+        await deleteLocalRecord(id, currentUser.uid, getDeviceId());
+      }
       setHistory((prev) => prev.filter((d) => d._id !== id));
       getStorageStatsApi().then(setStats).catch(() => {});
     } catch (e) {
@@ -49,6 +87,9 @@ export default function HistoryDrawer({ isOpen, onClose, onSelectDocument }) {
     setIsCleaning(true);
     try {
       await cleanStorageApi(false);
+      if (currentUser?.uid) {
+        await clearLocalRecordsForUser(currentUser.uid, getDeviceId());
+      }
       await fetchHistoryAndStats();
     } catch (e) {
       alert('Failed to clean storage.');
