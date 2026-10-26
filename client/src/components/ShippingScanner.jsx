@@ -12,17 +12,23 @@ import {
   Sliders,
   FileCheck
 } from 'lucide-react';
-import { extractShippingApi } from '../services/api';
+import { extractShippingApi, saveShippingHistoryApi } from '../services/api';
 import ShippingResultsView from './ShippingResultsView';
 
 const MAX_IMAGES = 10;
 
-export default function ShippingScanner({ settings = {} }) {
+export default function ShippingScanner({ settings = {}, results: externalResults = null, onResultsChange = null }) {
   const [selectedFiles, setSelectedFiles] = useState([]);
   const [previews, setPreviews] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
-  const [results, setResults] = useState(null);
+  const [localResults, setLocalResults] = useState(externalResults);
+  const results = externalResults !== undefined && externalResults !== null ? externalResults : localResults;
   const [errorMessage, setErrorMessage] = useState(null);
+
+  const updateResults = (val) => {
+    setLocalResults(val);
+    if (onResultsChange) onResultsChange(val);
+  };
   
   // OCR & enhancement options
   const [minConfidence, setMinConfidence] = useState(20);
@@ -110,7 +116,7 @@ export default function ShippingScanner({ settings = {} }) {
     previews.forEach((p) => URL.revokeObjectURL(p.url));
     setSelectedFiles([]);
     setPreviews([]);
-    setResults(null);
+    updateResults(null);
     setErrorMessage(null);
   };
 
@@ -126,7 +132,7 @@ export default function ShippingScanner({ settings = {} }) {
 
     setIsLoading(true);
     setErrorMessage(null);
-    setResults(null);
+    updateResults(null);
 
     try {
       const data = await extractShippingApi(selectedFiles, {
@@ -136,7 +142,24 @@ export default function ShippingScanner({ settings = {} }) {
         model_name: settings.model_name || 'llama-3.3-70b-versatile',
         groq_api_key: settings.groq_api_key || localStorage.getItem('groq_api_key') || '',
       });
-      setResults(data);
+      updateResults(data);
+
+      // Auto-persist extracted shipping labels to user history
+      if (Array.isArray(data)) {
+        for (const item of data) {
+          saveShippingHistoryApi({
+            carrier: item.carrier,
+            tracking_number: item.tracking_number,
+            sender: item.sender,
+            receiver: item.receiver,
+            package_details: item.package_details,
+            items: item.items,
+            barcodes: item.barcodes,
+            qr_codes: item.qr_codes,
+            raw_text: item.raw_ocr_text || ''
+          }).catch((err) => console.warn('Shipping history persistence notice:', err));
+        }
+      }
     } catch (err) {
       console.error('Shipping extraction failed:', err);
       const msg = err.response?.data?.detail || err.response?.data?.error || err.message || 'Failed to extract shipping labels.';

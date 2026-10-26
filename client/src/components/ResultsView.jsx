@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   AlertTriangle, 
   XCircle, 
@@ -34,7 +34,14 @@ import IdentityReferenceCard from './IdentityReferenceCard';
 import LiveFaceVerificationModal from './LiveFaceVerificationModal';
 import SecondIdVerificationModal from './SecondIdVerificationModal';
 
-export default function ResultsView({ result, onUploadAnother, onRetryScan, isRetrying }) {
+export default function ResultsView({ 
+  result, 
+  onUploadAnother, 
+  onRetryScan, 
+  isRetrying,
+  workflowState = null,
+  onWorkflowUpdate = null 
+}) {
   if (!result) return null;
 
   const { 
@@ -52,36 +59,94 @@ export default function ResultsView({ result, onUploadAnother, onRetryScan, isRe
     reference_card: initialRefCard
   } = result;
 
-  const [formData, setFormData] = useState(data || {});
-  const [confirmationStatus, setConfirmationStatus] = useState(initialStatus || 'Pending Confirmation');
-  const [confirmedId, setConfirmedId] = useState(initialSeqId || null);
-  const [referenceCardData, setReferenceCardData] = useState(initialRefCard || null);
+  const docKey = result.sequential_id || result.id || result._id || result.originalFileName || 'current_doc';
+  const prevDocKeyRef = useRef(docKey);
+
+  const [formData, setFormData] = useState(workflowState?.formData || data || {});
+  const [confirmationStatus, setConfirmationStatus] = useState(
+    workflowState?.confirmationStatus || initialStatus || 'Pending Confirmation'
+  );
+  const [confirmedId, setConfirmedId] = useState(
+    workflowState?.confirmedId || initialSeqId || result._id || null
+  );
+  const [referenceCardData, setReferenceCardData] = useState(
+    workflowState?.referenceCardData || initialRefCard || null
+  );
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [confirmMessage, setConfirmMessage] = useState(null);
+  const [confirmMessage, setConfirmMessage] = useState(workflowState?.confirmMessage || null);
   
   // Navigation Screens: 'ocr_review' | 'customer_verify' | 'rejected_review' | 'reference_card'
-  const [currentScreen, setCurrentScreen] = useState('ocr_review');
+  const [currentScreen, setCurrentScreen] = useState(
+    workflowState?.currentScreen ||
+    (initialStatus === 'Success' || (result._id && String(result._id).startsWith('IMG')) ? 'customer_verify' : 'ocr_review')
+  );
   
   // Customer Identity Verification State
-  const [identityStatus, setIdentityStatus] = useState('NOT_VERIFIED'); // 'NOT_VERIFIED' | 'VERIFIED' | 'UNCERTAIN' | 'FAILED'
-  const [verificationMethod, setVerificationMethod] = useState(null); // 'live_face' | 'second_id'
-  const [verificationScore, setVerificationScore] = useState(null);
-  const [verificationDetails, setVerificationDetails] = useState(null);
+  const [identityStatus, setIdentityStatus] = useState(workflowState?.identityStatus || 'NOT_VERIFIED'); // 'NOT_VERIFIED' | 'VERIFIED' | 'UNCERTAIN' | 'FAILED'
+  const [verificationMethod, setVerificationMethod] = useState(workflowState?.verificationMethod || null); // 'live_face' | 'second_id'
+  const [verificationScore, setVerificationScore] = useState(workflowState?.verificationScore || null);
+  const [verificationDetails, setVerificationDetails] = useState(workflowState?.verificationDetails || null);
   const [isLiveFaceModalOpen, setIsLiveFaceModalOpen] = useState(false);
   const [isSecondIdModalOpen, setIsSecondIdModalOpen] = useState(false);
 
+  // Sync state changes upward to parent workflow layer
+  const notifyWorkflow = (updates) => {
+    if (onWorkflowUpdate) {
+      onWorkflowUpdate({
+        currentScreen,
+        confirmationStatus,
+        confirmedId,
+        referenceCardData,
+        identityStatus,
+        verificationMethod,
+        verificationScore,
+        verificationDetails,
+        formData,
+        confirmMessage,
+        ...updates
+      });
+    }
+  };
+
   useEffect(() => {
-    setFormData(data || {});
-    setConfirmationStatus(result.status || 'Pending Confirmation');
-    setConfirmedId(result.sequential_id || result.id || null);
-    setReferenceCardData(result.reference_card || null);
-    setConfirmMessage(null);
-    setCurrentScreen(result.status === 'Success' ? 'customer_verify' : 'ocr_review');
-    setIdentityStatus('NOT_VERIFIED');
-    setVerificationMethod(null);
-    setVerificationScore(null);
-    setVerificationDetails(null);
-  }, [result]);
+    // Only reset state if this is genuinely a DIFFERENT document
+    if (prevDocKeyRef.current !== docKey) {
+      prevDocKeyRef.current = docKey;
+      const initialForm = data || {};
+      const nextStatus = result.status || 'Pending Confirmation';
+      const nextId = result.sequential_id || result.id || result._id || null;
+      const nextRefCard = result.reference_card || null;
+      const nextScreen = (nextStatus === 'Success' || (result._id && String(result._id).startsWith('IMG'))) 
+        ? 'customer_verify' 
+        : 'ocr_review';
+
+      setFormData(initialForm);
+      setConfirmationStatus(nextStatus);
+      setConfirmedId(nextId);
+      setReferenceCardData(nextRefCard);
+      setConfirmMessage(null);
+      setCurrentScreen(nextScreen);
+      setIdentityStatus('NOT_VERIFIED');
+      setVerificationMethod(null);
+      setVerificationScore(null);
+      setVerificationDetails(null);
+
+      if (onWorkflowUpdate) {
+        onWorkflowUpdate({
+          currentScreen: nextScreen,
+          confirmationStatus: nextStatus,
+          confirmedId: nextId,
+          referenceCardData: nextRefCard,
+          identityStatus: 'NOT_VERIFIED',
+          verificationMethod: null,
+          verificationScore: null,
+          verificationDetails: null,
+          formData: initialForm,
+          confirmMessage: null
+        });
+      }
+    }
+  }, [docKey, result]);
 
   const handleFieldChange = (field, val) => {
     setFormData(prev => ({ ...prev, [field]: val }));
@@ -107,10 +172,12 @@ export default function ResultsView({ result, onUploadAnother, onRetryScan, isRe
       };
 
       const response = await confirmVerificationApi(payload);
-      setConfirmedId(response.sequential_id || response.id);
+      const newSeqId = response.sequential_id || response.id;
+      const refCard = response.reference_card || null;
+      setConfirmedId(newSeqId);
       setConfirmationStatus('Success');
-      if (response.reference_card) {
-        setReferenceCardData(response.reference_card);
+      if (refCard) {
+        setReferenceCardData(refCard);
       }
       
       // Save locally to IndexedDB partitioned by active user & device
@@ -119,17 +186,29 @@ export default function ResultsView({ result, onUploadAnother, onRetryScan, isRe
       }
       
       // Move to Customer Identity Verification stage
-      setCurrentScreen('customer_verify');
-      setConfirmMessage({
+      const successMsg = {
         type: 'success',
-        text: `Document details confirmed (${response.sequential_id || response.id}). Please complete Customer Identity Verification.`
+        text: `Document details confirmed (${newSeqId}). Please complete Customer Identity Verification.`
+      };
+      setCurrentScreen('customer_verify');
+      setConfirmMessage(successMsg);
+
+      notifyWorkflow({
+        currentScreen: 'customer_verify',
+        confirmationStatus: 'Success',
+        confirmedId: newSeqId,
+        referenceCardData: refCard,
+        confirmMessage: successMsg,
+        formData: formData
       });
     } catch (err) {
       console.error('Confirmation error:', err);
-      setConfirmMessage({
+      const errMsg = {
         type: 'error',
-        text: 'Failed to record confirmation. Please try again.'
-      });
+        text: err.response?.data?.detail || 'Failed to record confirmation. Please try again.'
+      };
+      setConfirmMessage(errMsg);
+      notifyWorkflow({ confirmMessage: errMsg });
     } finally {
       setIsSubmitting(false);
     }
@@ -155,16 +234,33 @@ export default function ResultsView({ result, onUploadAnother, onRetryScan, isRe
       };
 
       const response = await confirmVerificationApi(payload);
-      setConfirmedId(response.sequential_id || response.id);
+      const newSeqId = response.sequential_id || response.id;
+      setConfirmedId(newSeqId);
       setConfirmationStatus('Failed');
       setReferenceCardData(null);
       setCurrentScreen('rejected_review');
-      setConfirmMessage({
+      const failMsg = {
         type: 'failed',
-        text: `Document marked as incorrect (Audit ID: ${response.sequential_id || response.id}). Choose next action below.`
+        text: `Document marked as incorrect (Audit ID: ${newSeqId}). Choose next action below.`
+      };
+      setConfirmMessage(failMsg);
+
+      notifyWorkflow({
+        currentScreen: 'rejected_review',
+        confirmationStatus: 'Failed',
+        confirmedId: newSeqId,
+        referenceCardData: null,
+        confirmMessage: failMsg,
+        formData: formData
       });
     } catch (err) {
       console.error('Wrong action error:', err);
+      const errMsg = {
+        type: 'error',
+        text: err.response?.data?.detail || 'Failed to record rejection. Please try again.'
+      };
+      setConfirmMessage(errMsg);
+      notifyWorkflow({ confirmMessage: errMsg });
     } finally {
       setIsSubmitting(false);
     }
@@ -176,27 +272,41 @@ export default function ResultsView({ result, onUploadAnother, onRetryScan, isRe
     setVerificationScore(res.score);
     setVerificationDetails(res.details);
 
+    let nextStatus = 'FAILED';
+    let msg = null;
+
     if (res.isVerified) {
-      setIdentityStatus('VERIFIED');
-      setConfirmMessage({
+      nextStatus = 'VERIFIED';
+      msg = {
         type: 'success',
         text: res.method === 'live_face' 
           ? `Customer Identity Verified! Live Face Match: ${res.score}%.` 
           : `Customer Identity Verified! Multi-Document Consistency: ${res.score}%.`
-      });
+      };
     } else if (res.status === 'UNCERTAIN') {
-      setIdentityStatus('UNCERTAIN');
-      setConfirmMessage({
+      nextStatus = 'UNCERTAIN';
+      msg = {
         type: 'warning',
         text: `Face match uncertain (${res.score}%). Please complete Second ID Verification to verify customer.`
-      });
+      };
     } else {
-      setIdentityStatus('FAILED');
-      setConfirmMessage({
+      nextStatus = 'FAILED';
+      msg = {
         type: 'failed',
         text: `Customer Verification Failed (${res.score || 0}%). Biometric mismatch.`
-      });
+      };
     }
+
+    setIdentityStatus(nextStatus);
+    setConfirmMessage(msg);
+
+    notifyWorkflow({
+      identityStatus: nextStatus,
+      verificationMethod: res.method,
+      verificationScore: res.score,
+      verificationDetails: res.details,
+      confirmMessage: msg
+    });
   };
 
   const currentDateTime = new Date().toLocaleString('en-IN', {
@@ -357,7 +467,10 @@ export default function ResultsView({ result, onUploadAnother, onRetryScan, isRe
 
           {referenceCardData && identityStatus === 'VERIFIED' && currentScreen !== 'reference_card' && (
             <button
-              onClick={() => setCurrentScreen('reference_card')}
+              onClick={() => {
+                setCurrentScreen('reference_card');
+                notifyWorkflow({ currentScreen: 'reference_card' });
+              }}
               className="px-3 py-1 bg-white hover:bg-slate-50 text-slate-700 rounded-lg border border-slate-200 text-[11px] font-bold transition shadow-sm cursor-pointer ml-3 flex-shrink-0"
             >
               View Reference Card →
@@ -376,12 +489,16 @@ export default function ResultsView({ result, onUploadAnother, onRetryScan, isRe
             onProcessNew={onUploadAnother}
             onRevoked={(refId) => {
               setReferenceCardData(prev => prev ? ({ ...prev, revoked: true, verification_status: 'REVOKED' }) : null);
+              notifyWorkflow({ referenceCardData: null });
             }}
           />
 
           <div className="text-center pt-2">
             <button
-              onClick={() => setCurrentScreen('customer_verify')}
+              onClick={() => {
+                setCurrentScreen('customer_verify');
+                notifyWorkflow({ currentScreen: 'customer_verify' });
+              }}
               className="text-xs text-indigo-600 font-bold hover:underline cursor-pointer"
             >
               ← Back to Customer Verification Dashboard

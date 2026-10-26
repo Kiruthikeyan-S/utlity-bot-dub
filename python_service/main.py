@@ -63,7 +63,15 @@ from storage import (
     get_extraction_by_id, 
     delete_extraction_by_id, 
     get_storage_stats, 
-    clean_storage
+    clean_storage,
+    save_shipping_record,
+    get_shipping_history,
+    get_shipping_record_by_id,
+    delete_shipping_record_by_id,
+    save_qr_record,
+    get_qr_history,
+    get_qr_record_by_id,
+    delete_qr_record_by_id
 )
 
 
@@ -234,16 +242,20 @@ def confirm_verification_decision(
     if not active_device:
         raise HTTPException(status_code=400, detail="Missing X-Device-Id header.")
     owner_uid = user["uid"]
-    res = save_confirmed_verification(
-        result_dict=payload.model_dump() if hasattr(payload, "model_dump") else payload.dict(),
-        action=payload.action,
-        edited_data=payload.data,
-        original_filename=payload.original_filename or "document.jpg",
-        thumbnail_image=payload.thumbnail_image,
-        portrait_photo=payload.portrait_photo,
-        device_id=active_device,
-        owner_uid=owner_uid
-    )
+    try:
+        res = save_confirmed_verification(
+            result_dict=payload.model_dump() if hasattr(payload, "model_dump") else payload.dict(),
+            action=payload.action,
+            edited_data=payload.data,
+            original_filename=payload.original_filename or "document.jpg",
+            thumbnail_image=payload.thumbnail_image,
+            portrait_photo=payload.portrait_photo,
+            device_id=active_device,
+            owner_uid=owner_uid
+        )
+    except Exception as save_err:
+        logger.error(f"Confirmation save error: {save_err}")
+        raise HTTPException(status_code=500, detail=f"Database persistence failed: {str(save_err)}")
 
     # Privacy-Safe Reference Card Generation on User Confirmation
     if payload.action == "correct":
@@ -271,6 +283,135 @@ def confirm_verification_decision(
         res["reference_card"] = None
 
     return res
+
+
+# ---------------------------------------------------------------------------
+# Shipping History Endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/shipping/save")
+def save_shipping_history_item(
+    payload: Dict[str, Any],
+    deviceId: Optional[str] = None,
+    x_device_id: Optional[str] = Header(None, alias="X-Device-Id"),
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Saves an extracted shipping label record to persistent cloud and local storage."""
+    active_device = x_device_id or deviceId
+    try:
+        saved = save_shipping_record(record_data=payload, owner_uid=user["uid"], device_id=active_device)
+        return {"success": True, "record": saved, "id": saved["_id"]}
+    except Exception as e:
+        logger.error(f"Failed to save shipping record: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to persist shipping record: {str(e)}")
+
+
+@app.get("/shipping/history")
+def list_shipping_history(
+    limit: int = 50,
+    page: int = 1,
+    deviceId: Optional[str] = None,
+    x_device_id: Optional[str] = Header(None, alias="X-Device-Id"),
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Retrieves shipping history records strictly for the authenticated user."""
+    active_device = x_device_id or deviceId
+    return get_shipping_history(limit=limit, page=page, device_id=active_device, owner_uid=user["uid"])
+
+
+@app.get("/shipping/history/{doc_id}")
+def retrieve_shipping_record(
+    doc_id: str,
+    deviceId: Optional[str] = None,
+    x_device_id: Optional[str] = Header(None, alias="X-Device-Id"),
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Retrieves a single shipping record strictly verifying owner_uid."""
+    active_device = x_device_id or deviceId
+    record = get_shipping_record_by_id(doc_id, device_id=active_device, owner_uid=user["uid"])
+    if not record:
+        raise HTTPException(status_code=404, detail="Shipping record not found or inaccessible.")
+    return record
+
+
+@app.delete("/shipping/history/{doc_id}")
+def remove_shipping_record(
+    doc_id: str,
+    deviceId: Optional[str] = None,
+    x_device_id: Optional[str] = Header(None, alias="X-Device-Id"),
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Deletes a shipping record strictly verifying owner_uid."""
+    active_device = x_device_id or deviceId
+    success = delete_shipping_record_by_id(doc_id, device_id=active_device, owner_uid=user["uid"])
+    if not success:
+        raise HTTPException(status_code=404, detail="Shipping record not found or permission denied.")
+    return {"message": "Shipping record deleted successfully."}
+
+
+# ---------------------------------------------------------------------------
+# QR / Barcode History Endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/qr/save")
+def save_qr_history_item(
+    payload: Dict[str, Any],
+    deviceId: Optional[str] = None,
+    x_device_id: Optional[str] = Header(None, alias="X-Device-Id"),
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Saves a QR code generation or scan record to persistent cloud and local storage."""
+    active_device = x_device_id or deviceId
+    try:
+        saved = save_qr_record(record_data=payload, owner_uid=user["uid"], device_id=active_device)
+        return {"success": True, "record": saved, "id": saved["_id"]}
+    except Exception as e:
+        logger.error(f"Failed to save QR record: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to persist QR record: {str(e)}")
+
+
+@app.get("/qr/history")
+def list_qr_history(
+    limit: int = 50,
+    page: int = 1,
+    action_type: Optional[str] = None,
+    deviceId: Optional[str] = None,
+    x_device_id: Optional[str] = Header(None, alias="X-Device-Id"),
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Retrieves QR history records strictly for the authenticated user."""
+    active_device = x_device_id or deviceId
+    return get_qr_history(limit=limit, page=page, action_type=action_type, device_id=active_device, owner_uid=user["uid"])
+
+
+@app.get("/qr/history/{doc_id}")
+def retrieve_qr_record(
+    doc_id: str,
+    deviceId: Optional[str] = None,
+    x_device_id: Optional[str] = Header(None, alias="X-Device-Id"),
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Retrieves a single QR history record strictly verifying owner_uid."""
+    active_device = x_device_id or deviceId
+    record = get_qr_record_by_id(doc_id, device_id=active_device, owner_uid=user["uid"])
+    if not record:
+        raise HTTPException(status_code=404, detail="QR record not found or inaccessible.")
+    return record
+
+
+@app.delete("/qr/history/{doc_id}")
+def remove_qr_record(
+    doc_id: str,
+    deviceId: Optional[str] = None,
+    x_device_id: Optional[str] = Header(None, alias="X-Device-Id"),
+    user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Deletes a QR history record strictly verifying owner_uid."""
+    active_device = x_device_id or deviceId
+    success = delete_qr_record_by_id(doc_id, device_id=active_device, owner_uid=user["uid"])
+    if not success:
+        raise HTTPException(status_code=404, detail="QR record not found or permission denied.")
+    return {"message": "QR record deleted successfully."}
 
 
 @app.get("/reference/{ref_id}")

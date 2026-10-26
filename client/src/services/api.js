@@ -302,5 +302,69 @@ export const scanDocumentCodesApi = async (file, minConfidence = 20.0) => {
   return response.data;
 };
 
+/**
+ * Saves extracted shipping label results to cloud & local history.
+ */
+export const saveShippingHistoryApi = async (payload) => {
+  const response = await api.post('/shipping/save', payload);
+  return response.data;
+};
+
+/**
+ * Fetches user's shipping label history.
+ */
+export const getShippingHistoryApi = async (params = {}) => {
+  const response = await api.get('/shipping/history', { params });
+  return response.data;
+};
+
+/**
+ * Retrieves a single shipping record by ID.
+ */
+export const getShippingByIdApi = async (docId) => {
+  const response = await api.get(`/shipping/history/${docId}`);
+  return response.data;
+};
+
+/**
+ * Deletes a shipping record by ID.
+ */
+export const deleteShippingByIdApi = async (docId) => {
+  const response = await api.delete(`/shipping/history/${docId}`);
+  return response.data;
+};
+
+/**
+ * Saves a generated or scanned QR/barcode record to cloud & local history.
+ */
+export const saveQrHistoryApi = async (payload) => {
+  const response = await api.post('/qr/save', payload);
+  return response.data;
+};
+
+/**
+ * Fetches user's QR/barcode history (supports filter by action_type: 'generate' | 'scan').
+ */
+export const getQrHistoryApi = async (params = {}) => {
+  const response = await api.get('/qr/history', { params });
+  return response.data;
+};
+
+/**
+ * Retrieves a single QR record by ID.
+ */
+export const getQrByIdApi = async (docId) => {
+  const response = await api.get(`/qr/history/${docId}`);
+  return response.data;
+};
+
+/**
+ * Deletes a QR record by ID.
+ */
+export const deleteQrByIdApi = async (docId) => {
+  const response = await api.delete(`/qr/history/${docId}`);
+  return response.data;
+};
+
 
 

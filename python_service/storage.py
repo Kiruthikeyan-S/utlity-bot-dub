@@ -24,18 +24,20 @@ logger = logging.getLogger("utility_bot.storage")
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 FAILED_HISTORY_FILE = os.path.join(DATA_DIR, "failed_history.json")
+SHIPPING_HISTORY_FILE = os.path.join(DATA_DIR, "shipping_history.json")
+QR_HISTORY_FILE = os.path.join(DATA_DIR, "qr_history.json")
 COUNTERS_FILE = os.path.join(DATA_DIR, "counters.json")
 RETENTION_DAYS = 30
 
 os.makedirs(DATA_DIR, exist_ok=True)
-for file_path in [HISTORY_FILE, FAILED_HISTORY_FILE]:
+for file_path in [HISTORY_FILE, FAILED_HISTORY_FILE, SHIPPING_HISTORY_FILE, QR_HISTORY_FILE]:
     if not os.path.exists(file_path):
         with open(file_path, "w", encoding="utf-8") as f:
             f.write("[]\n")
 
 if not os.path.exists(COUNTERS_FILE):
     with open(COUNTERS_FILE, "w", encoding="utf-8") as f:
-        json.dump({"IMG": 0, "FAIL": 0}, f, indent=2)
+        json.dump({"IMG": 0, "FAIL": 0, "SHIP": 0, "QR": 0}, f, indent=2)
         f.write("\n")
 
 # ---------------------------------------------------------------------------
@@ -157,6 +159,12 @@ def ensure_database_indexes():
             db["verifications"].create_index([("expiresAt", 1)], background=True)
             # Owner index on failed verifications
             db["failed_verifications"].create_index([("owner_uid", 1), ("createdAt", -1)], background=True)
+            # Owner index on shipping history
+            db["shipping_history"].create_index([("owner_uid", 1), ("createdAt", -1)], background=True)
+            db["shipping_history"].create_index([("expiresAt", 1)], background=True)
+            # Owner index on QR history
+            db["qr_history"].create_index([("owner_uid", 1), ("createdAt", -1)], background=True)
+            db["qr_history"].create_index([("expiresAt", 1)], background=True)
             # Reference cards indexes
             db["identity_references"].create_index([("reference_id", 1)], unique=True, background=True)
             db["identity_references"].create_index([("owner_uid", 1)], background=True)
@@ -599,6 +607,382 @@ def delete_extraction_by_id(
     return False
 
 
+# ---------------------------------------------------------------------------
+# Shipping History Operations
+# ---------------------------------------------------------------------------
+
+def save_shipping_record(
+    record_data: dict,
+    owner_uid: str,
+    device_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Saves an extracted shipping-label record bound to owner_uid and deviceId."""
+    if not owner_uid:
+        raise ValueError("Cannot save shipping record without authenticated owner_uid.")
+
+    seq_id = get_next_sequence_id("SHIP")
+    now_utc = datetime.now(timezone.utc)
+    created_at_iso = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    expires_at_iso = (now_utc + timedelta(days=RETENTION_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    record = {
+        "_id": seq_id,
+        "sequentialId": seq_id,
+        "owner_uid": owner_uid,
+        "deviceId": device_id or "default_client",
+        "category": "shipping",
+        "title": record_data.get("title") or record_data.get("carrier") or f"Shipping Label {seq_id}",
+        "carrier": record_data.get("carrier") or "Standard",
+        "tracking_number": record_data.get("tracking_number") or "",
+        "sender": record_data.get("sender") or {},
+        "receiver": record_data.get("receiver") or {},
+        "package_details": record_data.get("package_details") or {},
+        "items": record_data.get("items") or [],
+        "barcodes": record_data.get("barcodes") or [],
+        "qr_codes": record_data.get("qr_codes") or [],
+        "raw_text": (record_data.get("raw_text") or "")[:2000],
+        "extracted_data": record_data,
+        "createdAt": created_at_iso,
+        "expiresAt": expires_at_iso,
+        "retentionDays": RETENTION_DAYS
+    }
+
+    records = read_file_records(SHIPPING_HISTORY_FILE, auto_purge=True)
+    records.insert(0, record)
+    if len(records) > 500:
+        records = records[:500]
+    write_file_records(SHIPPING_HISTORY_FILE, records)
+
+    if MONGODB_URI:
+        sync_record_to_mongodb("shipping_history", seq_id, record)
+
+    return record
+
+
+def get_shipping_history(
+    limit: int = 50,
+    page: int = 1,
+    device_id: Optional[str] = None,
+    owner_uid: Optional[str] = None
+) -> Dict[str, Any]:
+    """Retrieves shipping history records strictly for the authenticated owner_uid."""
+    if not owner_uid:
+        return {
+            "documents": [],
+            "total": 0,
+            "page": page,
+            "pages": 1,
+            "deviceId": device_id,
+            "owner_uid": owner_uid,
+            "retentionDays": RETENTION_DAYS,
+            "source": "shipping_store"
+        }
+
+    if MONGODB_URI:
+        try:
+            client = get_mongo_client()
+            if client:
+                db = client[MONGODB_DB_NAME]
+                query = {"owner_uid": owner_uid}
+                total = db["shipping_history"].count_documents(query)
+                cursor = db["shipping_history"].find(query).sort("createdAt", -1).skip((page - 1) * limit).limit(limit)
+                docs = list(cursor)
+                for d in docs:
+                    if "_id" in d and not isinstance(d["_id"], str):
+                        d["_id"] = str(d["_id"])
+                pages = (total + limit - 1) // limit if total > 0 else 1
+                return {
+                    "documents": docs,
+                    "total": total,
+                    "page": page,
+                    "pages": pages,
+                    "deviceId": device_id,
+                    "owner_uid": owner_uid,
+                    "retentionDays": RETENTION_DAYS,
+                    "source": "mongodb_atlas"
+                }
+        except Exception as err:
+            logger.warning(f"MongoDB shipping query error: {err}")
+
+    records = read_file_records(SHIPPING_HISTORY_FILE, auto_purge=True)
+    records = [d for d in records if d.get("owner_uid") == owner_uid]
+    total = len(records)
+    start = (page - 1) * limit
+    paginated = records[start:start + limit]
+    pages = (total + limit - 1) // limit if total > 0 else 1
+    return {
+        "documents": paginated,
+        "total": total,
+        "page": page,
+        "pages": pages,
+        "deviceId": device_id,
+        "owner_uid": owner_uid,
+        "retentionDays": RETENTION_DAYS,
+        "source": "local_shipping_store"
+    }
+
+
+def get_shipping_record_by_id(
+    doc_id: str,
+    device_id: Optional[str] = None,
+    owner_uid: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """Retrieves a single shipping record verifying owner_uid."""
+    if not owner_uid:
+        return None
+
+    if MONGODB_URI:
+        try:
+            client = get_mongo_client()
+            if client:
+                db = client[MONGODB_DB_NAME]
+                doc = db["shipping_history"].find_one({"_id": doc_id, "owner_uid": owner_uid})
+                if doc:
+                    if "_id" in doc and not isinstance(doc["_id"], str):
+                        doc["_id"] = str(doc["_id"])
+                    return doc
+        except Exception:
+            pass
+
+    records = read_file_records(SHIPPING_HISTORY_FILE, auto_purge=True)
+    for d in records:
+        if (d.get("_id") == doc_id or d.get("sequentialId") == doc_id) and d.get("owner_uid") == owner_uid:
+            return d
+    return None
+
+
+def delete_shipping_record_by_id(
+    doc_id: str,
+    device_id: Optional[str] = None,
+    owner_uid: Optional[str] = None
+) -> bool:
+    """Deletes a shipping record strictly verifying owner_uid."""
+    if not owner_uid:
+        return False
+
+    records = read_file_records(SHIPPING_HISTORY_FILE, auto_purge=False)
+    new_records = []
+    found = False
+    for d in records:
+        if (d.get("_id") == doc_id or d.get("sequentialId") == doc_id) and d.get("owner_uid") == owner_uid:
+            found = True
+        else:
+            new_records.append(d)
+
+    if found:
+        write_file_records(SHIPPING_HISTORY_FILE, new_records)
+        if MONGODB_URI:
+            try:
+                client = get_mongo_client()
+                if client:
+                    db = client[MONGODB_DB_NAME]
+                    db["shipping_history"].delete_one({"_id": doc_id, "owner_uid": owner_uid})
+            except Exception:
+                pass
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# QR / Barcode History Operations
+# ---------------------------------------------------------------------------
+
+def save_qr_record(
+    record_data: dict,
+    owner_uid: str,
+    device_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Saves a QR generation or optical scan record bound to owner_uid and deviceId.
+    Strictly sanitizes plain-text credentials and Wi-Fi passwords.
+    """
+    if not owner_uid:
+        raise ValueError("Cannot save QR record without authenticated owner_uid.")
+
+    seq_id = get_next_sequence_id("QR")
+    now_utc = datetime.now(timezone.utc)
+    created_at_iso = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    expires_at_iso = (now_utc + timedelta(days=RETENTION_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    action_type = record_data.get("action_type") or record_data.get("action") or "generate"
+    qr_type = record_data.get("qr_type") or record_data.get("type") or "text"
+
+    # Sanitize Wi-Fi and passwords - NEVER store plaintext passwords
+    raw_fields = dict(record_data.get("fields") or {})
+    if "password" in raw_fields:
+        raw_fields["password"] = "***"
+
+    raw_content = record_data.get("content") or record_data.get("data") or ""
+    if isinstance(raw_content, str) and "P:" in raw_content and "WIFI:" in raw_content:
+        import re
+        raw_content = re.sub(r'P:[^;]*;', 'P:***;', raw_content)
+
+    record = {
+        "_id": seq_id,
+        "sequentialId": seq_id,
+        "owner_uid": owner_uid,
+        "deviceId": device_id or "default_client",
+        "category": "qr",
+        "action_type": action_type,  # 'generate' | 'scan'
+        "qr_type": qr_type,
+        "content_type": record_data.get("content_type") or qr_type,
+        "content": raw_content,
+        "fields": raw_fields,
+        "metadata": record_data.get("metadata") or {
+            "format": record_data.get("format", "png"),
+            "size": record_data.get("size", 400),
+            "error_correction": record_data.get("error_correction", "M"),
+            "symbology": record_data.get("symbology")
+        },
+        "barcodes": record_data.get("barcodes") or [],
+        "qr_codes": record_data.get("qr_codes") or [],
+        "ocr": record_data.get("ocr"),
+        "createdAt": created_at_iso,
+        "expiresAt": expires_at_iso,
+        "retentionDays": RETENTION_DAYS
+    }
+
+    records = read_file_records(QR_HISTORY_FILE, auto_purge=True)
+    records.insert(0, record)
+    if len(records) > 500:
+        records = records[:500]
+    write_file_records(QR_HISTORY_FILE, records)
+
+    if MONGODB_URI:
+        sync_record_to_mongodb("qr_history", seq_id, record)
+
+    return record
+
+
+def get_qr_history(
+    limit: int = 50,
+    page: int = 1,
+    action_type: Optional[str] = None,
+    device_id: Optional[str] = None,
+    owner_uid: Optional[str] = None
+) -> Dict[str, Any]:
+    """Retrieves QR history records strictly for the authenticated owner_uid."""
+    if not owner_uid:
+        return {
+            "documents": [],
+            "total": 0,
+            "page": page,
+            "pages": 1,
+            "deviceId": device_id,
+            "owner_uid": owner_uid,
+            "retentionDays": RETENTION_DAYS,
+            "source": "qr_store"
+        }
+
+    if MONGODB_URI:
+        try:
+            client = get_mongo_client()
+            if client:
+                db = client[MONGODB_DB_NAME]
+                query: Dict[str, Any] = {"owner_uid": owner_uid}
+                if action_type:
+                    query["action_type"] = action_type
+                total = db["qr_history"].count_documents(query)
+                cursor = db["qr_history"].find(query).sort("createdAt", -1).skip((page - 1) * limit).limit(limit)
+                docs = list(cursor)
+                for d in docs:
+                    if "_id" in d and not isinstance(d["_id"], str):
+                        d["_id"] = str(d["_id"])
+                pages = (total + limit - 1) // limit if total > 0 else 1
+                return {
+                    "documents": docs,
+                    "total": total,
+                    "page": page,
+                    "pages": pages,
+                    "deviceId": device_id,
+                    "owner_uid": owner_uid,
+                    "retentionDays": RETENTION_DAYS,
+                    "source": "mongodb_atlas"
+                }
+        except Exception as err:
+            logger.warning(f"MongoDB qr query error: {err}")
+
+    records = read_file_records(QR_HISTORY_FILE, auto_purge=True)
+    records = [d for d in records if d.get("owner_uid") == owner_uid]
+    if action_type:
+        records = [d for d in records if d.get("action_type") == action_type]
+    total = len(records)
+    start = (page - 1) * limit
+    paginated = records[start:start + limit]
+    pages = (total + limit - 1) // limit if total > 0 else 1
+    return {
+        "documents": paginated,
+        "total": total,
+        "page": page,
+        "pages": pages,
+        "deviceId": device_id,
+        "owner_uid": owner_uid,
+        "retentionDays": RETENTION_DAYS,
+        "source": "local_qr_store"
+    }
+
+
+def get_qr_record_by_id(
+    doc_id: str,
+    device_id: Optional[str] = None,
+    owner_uid: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """Retrieves a single QR history record verifying owner_uid."""
+    if not owner_uid:
+        return None
+
+    if MONGODB_URI:
+        try:
+            client = get_mongo_client()
+            if client:
+                db = client[MONGODB_DB_NAME]
+                doc = db["qr_history"].find_one({"_id": doc_id, "owner_uid": owner_uid})
+                if doc:
+                    if "_id" in doc and not isinstance(doc["_id"], str):
+                        doc["_id"] = str(doc["_id"])
+                    return doc
+        except Exception:
+            pass
+
+    records = read_file_records(QR_HISTORY_FILE, auto_purge=True)
+    for d in records:
+        if (d.get("_id") == doc_id or d.get("sequentialId") == doc_id) and d.get("owner_uid") == owner_uid:
+            return d
+    return None
+
+
+def delete_qr_record_by_id(
+    doc_id: str,
+    device_id: Optional[str] = None,
+    owner_uid: Optional[str] = None
+) -> bool:
+    """Deletes a QR record strictly verifying owner_uid."""
+    if not owner_uid:
+        return False
+
+    records = read_file_records(QR_HISTORY_FILE, auto_purge=False)
+    new_records = []
+    found = False
+    for d in records:
+        if (d.get("_id") == doc_id or d.get("sequentialId") == doc_id) and d.get("owner_uid") == owner_uid:
+            found = True
+        else:
+            new_records.append(d)
+
+    if found:
+        write_file_records(QR_HISTORY_FILE, new_records)
+        if MONGODB_URI:
+            try:
+                client = get_mongo_client()
+                if client:
+                    db = client[MONGODB_DB_NAME]
+                    db["qr_history"].delete_one({"_id": doc_id, "owner_uid": owner_uid})
+            except Exception:
+                pass
+        return True
+    return False
+
+
 def get_storage_stats(
     device_id: Optional[str] = None, 
     owner_uid: Optional[str] = None
@@ -606,33 +990,43 @@ def get_storage_stats(
     """Returns storage space usage and record count for the requesting authenticated user."""
     history = read_history(auto_purge=True)
     failed = read_failed_history(auto_purge=True)
+    shipping = read_file_records(SHIPPING_HISTORY_FILE, auto_purge=True)
+    qr_records = read_file_records(QR_HISTORY_FILE, auto_purge=True)
     
     if owner_uid:
         user_history = [d for d in history if d.get("owner_uid") == owner_uid]
         user_failed = [d for d in failed if d.get("owner_uid") == owner_uid]
+        user_shipping = [d for d in shipping if d.get("owner_uid") == owner_uid]
+        user_qr = [d for d in qr_records if d.get("owner_uid") == owner_uid]
     else:
         user_history = []
         user_failed = []
+        user_shipping = []
+        user_qr = []
 
     file_size_bytes = 0
-    for fp in [HISTORY_FILE, FAILED_HISTORY_FILE]:
+    for fp in [HISTORY_FILE, FAILED_HISTORY_FILE, SHIPPING_HISTORY_FILE, QR_HISTORY_FILE]:
         if os.path.exists(fp):
             file_size_bytes += os.path.getsize(fp)
     
     kb_size = round(file_size_bytes / 1024.0, 1)
     mb_size = round(file_size_bytes / (1024.0 * 1024.0), 2)
 
+    total_records = len(user_history) + len(user_failed) + len(user_shipping) + len(user_qr)
+
     return {
         "deviceRecords": len(user_history),
         "totalSuccessRecords": len(user_history),
         "totalFailedRecords": len(user_failed),
-        "totalRecords": len(user_history) + len(user_failed),
+        "totalShippingRecords": len(user_shipping),
+        "totalQrRecords": len(user_qr),
+        "totalRecords": total_records,
         "maxRecords": 500,
         "retentionDays": RETENTION_DAYS,
         "storageSizeBytes": file_size_bytes,
         "storageSizeKB": kb_size,
         "storageSizeMB": mb_size,
-        "percentUsed": min(100, round(((len(user_history) + len(user_failed)) / 500.0) * 100, 1)),
+        "percentUsed": min(100, round((total_records / 500.0) * 100, 1)),
         "deviceId": device_id,
         "owner_uid": owner_uid,
         "databaseEngine": "MongoDB Atlas" if MONGODB_URI else "Local JSON Store"
@@ -683,24 +1077,16 @@ def clean_storage(
         return False
 
     # 1. Clean local JSON files
-    history = read_history(auto_purge=False)
     del_count = 0
-    new_history = []
-    for d in history:
-        if is_eligible_for_deletion(d):
-            del_count += 1
-        else:
-            new_history.append(d)
-    write_file_records(HISTORY_FILE, new_history)
-
-    failed = read_failed_history(auto_purge=False)
-    new_failed = []
-    for d in failed:
-        if is_eligible_for_deletion(d):
-            del_count += 1
-        else:
-            new_failed.append(d)
-    write_file_records(FAILED_HISTORY_FILE, new_failed)
+    for target_file in [HISTORY_FILE, FAILED_HISTORY_FILE, SHIPPING_HISTORY_FILE, QR_HISTORY_FILE]:
+        docs = read_file_records(target_file, auto_purge=False)
+        remaining = []
+        for d in docs:
+            if is_eligible_for_deletion(d):
+                del_count += 1
+            else:
+                remaining.append(d)
+        write_file_records(target_file, remaining)
 
     # 2. Clean MongoDB Atlas
     if MONGODB_URI:
@@ -720,7 +1106,9 @@ def clean_storage(
                     }
                 r1 = db["verifications"].delete_many(query)
                 r2 = db["failed_verifications"].delete_many(query)
-                del_count = max(del_count, r1.deleted_count + r2.deleted_count)
+                r3 = db["shipping_history"].delete_many(query)
+                r4 = db["qr_history"].delete_many(query)
+                del_count = max(del_count, r1.deleted_count + r2.deleted_count + r3.deleted_count + r4.deleted_count)
         except Exception as e:
             logger.error(f"MongoDB storage cleanup error: {e}")
             raise RuntimeError(f"Database cleanup error: {e}")

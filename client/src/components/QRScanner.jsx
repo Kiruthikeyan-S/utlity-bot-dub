@@ -15,16 +15,16 @@ import {
   CheckCircle2,
   Eye
 } from 'lucide-react';
-import { scanCodeApi, scanDocumentCodesApi } from '../services/api';
+import { scanCodeApi, scanDocumentCodesApi, saveQrHistoryApi } from '../services/api';
 import { lookupCodeInfo } from './CodeResults';
 
-export default function QRScanner() {
+export default function QRScanner({ initialData = null, onStateChange = null }) {
   const [selectedFile, setSelectedFile] = useState(null);
   const [previewUrl, setPreviewUrl] = useState(null);
   const [scanMode, setScanMode] = useState('codes_only'); // 'codes_only' | 'combined_ocr'
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [results, setResults] = useState(null);
+  const [results, setResults] = useState(initialData?.scan_results || initialData?.results || null);
   const [copiedKey, setCopiedKey] = useState(null);
 
   const fileInputRef = useRef(null);
@@ -78,6 +78,25 @@ export default function QRScanner() {
         res = await scanCodeApi(selectedFile);
       }
       setResults(res);
+
+      if (onStateChange) {
+        onStateChange({ scan_results: res });
+      }
+
+      // Auto-persist scan results to QR/barcode history
+      const detectedContent = res.qr_codes?.[0]?.data || res.barcodes?.[0]?.data || res.ocr?.raw_text || 'Optical Scan Result';
+      saveQrHistoryApi({
+        action_type: 'scan',
+        qr_type: 'scan',
+        content: detectedContent,
+        barcodes: res.barcodes || [],
+        qr_codes: res.qr_codes || [],
+        ocr: res.ocr || null,
+        metadata: {
+          filename: res.filename,
+          total_detected: res.total_detected || 0
+        }
+      }).catch((histErr) => console.warn('QR scan history save notice:', histErr));
     } catch (err) {
       const msg = err.response?.data?.detail || err.message || 'Failed to scan codes from image.';
       setError(msg);

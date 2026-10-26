@@ -38,6 +38,9 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [isRetrying, setIsRetrying] = useState(false);
   const [extractionResult, setExtractionResult] = useState(null);
+  const [verificationWorkflowState, setVerificationWorkflowState] = useState(null);
+  const [shippingResults, setShippingResults] = useState(null);
+  const [qrSessionState, setQrSessionState] = useState(null);
   const [errorMessage, setErrorMessage] = useState(null);
   const [activeTab, setActiveTab] = useState('fields');
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
@@ -54,6 +57,9 @@ export default function App() {
         // Account switched or logged out: clear all visible extracted state & cache
         setSelectedFile(null);
         setExtractionResult(null);
+        setVerificationWorkflowState(null);
+        setShippingResults(null);
+        setQrSessionState(null);
         setErrorMessage(null);
         setActiveTab('fields');
         setIsHistoryOpen(false);
@@ -66,6 +72,9 @@ export default function App() {
     const handleUnauthorized = () => {
       setSelectedFile(null);
       setExtractionResult(null);
+      setVerificationWorkflowState(null);
+      setShippingResults(null);
+      setQrSessionState(null);
       setErrorMessage(null);
       setCurrentUser(null);
     };
@@ -96,6 +105,14 @@ export default function App() {
     try {
       const result = await extractDocumentApi(selectedFile, settings);
       setExtractionResult(result);
+      setVerificationWorkflowState({
+        currentScreen: result.status === 'Success' ? 'customer_verify' : 'ocr_review',
+        confirmationStatus: result.status || 'Pending Confirmation',
+        confirmedId: result.sequential_id || result.id || null,
+        referenceCardData: result.reference_card || null,
+        formData: result.data || {},
+        identityStatus: 'NOT_VERIFIED'
+      });
       setActiveTab('fields');
     } catch (err) {
       console.error('Extraction failed:', err);
@@ -119,6 +136,14 @@ export default function App() {
       // Deep Multi-Pass OCR scan with bilateral denoising & contrast enhancement
       const result = await extractDocumentApi(selectedFile, settings, true);
       setExtractionResult(result);
+      setVerificationWorkflowState({
+        currentScreen: result.status === 'Success' ? 'customer_verify' : 'ocr_review',
+        confirmationStatus: result.status || 'Pending Confirmation',
+        confirmedId: result.sequential_id || result.id || null,
+        referenceCardData: result.reference_card || null,
+        formData: result.data || {},
+        identityStatus: 'NOT_VERIFIED'
+      });
       setActiveTab('fields');
     } catch (err) {
       console.error('Retry scan failed:', err);
@@ -132,6 +157,7 @@ export default function App() {
   const handleClear = () => {
     setSelectedFile(null);
     setExtractionResult(null);
+    setVerificationWorkflowState(null);
     setErrorMessage(null);
   };
 
@@ -192,14 +218,21 @@ export default function App() {
       {/* PAGE 1: SHIPPING LABEL SCANNER */}
       {currentPage === 'shipping_scanner' && (
         <main className="flex-1 w-full max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-6">
-          <ShippingScanner settings={settings} />
+          <ShippingScanner 
+            settings={settings} 
+            results={shippingResults}
+            onResultsChange={setShippingResults}
+          />
         </main>
       )}
 
       {/* PAGE 2: QR & BARCODE TOOLS (Generator + Standalone Scanner) */}
       {currentPage === 'qr_tools' && (
         <main className="flex-1 w-full max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-6">
-          <QRTools />
+          <QRTools 
+            sessionState={qrSessionState}
+            onSessionStateChange={setQrSessionState}
+          />
         </main>
       )}
 
@@ -316,6 +349,10 @@ export default function App() {
                   onUploadAnother={handleClear}
                   onRetryScan={handleRetryScan}
                   isRetrying={isRetrying}
+                  workflowState={verificationWorkflowState}
+                  onWorkflowUpdate={(updatedState) => {
+                    setVerificationWorkflowState((prev) => ({ ...prev, ...updatedState }));
+                  }}
                 />
               )}
 
@@ -360,8 +397,55 @@ export default function App() {
         currentUser={currentUser}
         onSelectDocument={(doc) => {
           setCurrentPage('id_verification');
-          setExtractionResult(doc);
+          const isSuccess = doc.status === 'Success' || (doc._id && String(doc._id).startsWith('IMG'));
+          const restoredResult = {
+            ...doc,
+            document_type: doc.documentType || doc.document_type,
+            is_valid: doc.isValid !== undefined ? doc.isValid : true,
+            status: doc.status || (isSuccess ? 'Success' : 'Failed'),
+            sequential_id: doc._id || doc.sequentialId,
+            reference_card: doc.reference_card || null,
+            images: doc.thumbnail ? { original: doc.thumbnail } : (doc.images || {}),
+            portrait_photo: doc.portraitPhoto || doc.portrait_photo || null,
+            data: doc.data || {}
+          };
+          setExtractionResult(restoredResult);
+          setVerificationWorkflowState({
+            currentScreen: isSuccess ? 'customer_verify' : 'ocr_review',
+            confirmationStatus: restoredResult.status,
+            confirmedId: doc._id || doc.sequentialId,
+            referenceCardData: doc.reference_card || null,
+            formData: doc.data || {},
+            identityStatus: 'NOT_VERIFIED'
+          });
           setActiveTab('fields');
+        }}
+        onSelectShipping={(shipDoc) => {
+          setCurrentPage('shipping_scanner');
+          const itemData = shipDoc.extracted_data || shipDoc;
+          setShippingResults(Array.isArray(itemData) ? itemData : [itemData]);
+        }}
+        onSelectQr={(qrDoc) => {
+          setCurrentPage('qr_tools');
+          if (qrDoc.action_type === 'scan') {
+            setQrSessionState({
+              activeTab: 'scan',
+              scannerData: {
+                scan_results: {
+                  filename: qrDoc.metadata?.filename || 'Restored Scan',
+                  qr_codes: qrDoc.qr_codes || [],
+                  barcodes: qrDoc.barcodes || [],
+                  ocr: qrDoc.ocr || null,
+                  total_detected: (qrDoc.qr_codes?.length || 0) + (qrDoc.barcodes?.length || 0)
+                }
+              }
+            });
+          } else {
+            setQrSessionState({
+              activeTab: 'generate',
+              generatorData: qrDoc
+            });
+          }
         }}
       />
 

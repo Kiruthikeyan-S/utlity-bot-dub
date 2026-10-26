@@ -20,7 +20,7 @@ import {
   FileCode,
   Info
 } from 'lucide-react';
-import { generateQrApi } from '../services/api';
+import { generateQrApi, saveQrHistoryApi } from '../services/api';
 
 const QR_TYPES = [
   { id: 'url', label: 'Website URL', icon: LinkIcon, desc: 'Opens a link in mobile browser' },
@@ -53,30 +53,30 @@ const SIZE_OPTIONS = [
   { value: 1200, label: '1200 × 1200 px (Ultra HD)' }
 ];
 
-export default function QRGenerator() {
-  const [qrType, setQrType] = useState('url');
-  const [errorCorrection, setErrorCorrection] = useState('M');
-  const [size, setSize] = useState(400);
-  const [format, setFormat] = useState('png');
+export default function QRGenerator({ initialData = null, onStateChange = null }) {
+  const [qrType, setQrType] = useState(initialData?.qr_type || 'url');
+  const [errorCorrection, setErrorCorrection] = useState(initialData?.metadata?.error_correction || 'M');
+  const [size, setSize] = useState(initialData?.metadata?.size || 400);
+  const [format, setFormat] = useState(initialData?.metadata?.format || 'png');
 
   // Dynamic Form Fields
-  const [textVal, setTextVal] = useState('');
-  const [urlVal, setUrlVal] = useState('https://');
-  const [phoneVal, setPhoneVal] = useState('');
-  const [emailFields, setEmailFields] = useState({ email: '', subject: '', body: '' });
-  const [smsFields, setSmsFields] = useState({ phone: '', message: '' });
-  const [wifiFields, setWifiFields] = useState({ ssid: '', password: '', auth_type: 'WPA', hidden: false });
-  const [vcardFields, setVcardFields] = useState({ name: '', phone: '', email: '', company: '', title: '', address: '', url: '' });
-  const [locationFields, setLocationFields] = useState({ latitude: '', longitude: '' });
-  const [productVal, setProductVal] = useState('');
-  const [orderVal, setOrderVal] = useState('');
-  const [shippingFields, setShippingFields] = useState({ shipping_id: '', tracking_url: '' });
-  const [jsonVal, setJsonVal] = useState('{\n  "id": "ITEM-101",\n  "status": "ACTIVE"\n}');
+  const [textVal, setTextVal] = useState(initialData?.content || '');
+  const [urlVal, setUrlVal] = useState(initialData?.content || 'https://');
+  const [phoneVal, setPhoneVal] = useState(initialData?.fields?.phone || '');
+  const [emailFields, setEmailFields] = useState(initialData?.fields || { email: '', subject: '', body: '' });
+  const [smsFields, setSmsFields] = useState(initialData?.fields || { phone: '', message: '' });
+  const [wifiFields, setWifiFields] = useState(initialData?.fields || { ssid: '', password: '', auth_type: 'WPA', hidden: false });
+  const [vcardFields, setVcardFields] = useState(initialData?.fields || { name: '', phone: '', email: '', company: '', title: '', address: '', url: '' });
+  const [locationFields, setLocationFields] = useState(initialData?.fields || { latitude: '', longitude: '' });
+  const [productVal, setProductVal] = useState(initialData?.content || '');
+  const [orderVal, setOrderVal] = useState(initialData?.content || '');
+  const [shippingFields, setShippingFields] = useState(initialData?.fields || { shipping_id: '', tracking_url: '' });
+  const [jsonVal, setJsonVal] = useState(initialData?.content || '{\n  "id": "ITEM-101",\n  "status": "ACTIVE"\n}');
 
   // UI States
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [result, setResult] = useState(null);
+  const [result, setResult] = useState(initialData?.generated_result || null);
   const [copied, setCopied] = useState(false);
 
   const handleGenerate = async (e) => {
@@ -139,6 +139,30 @@ export default function QRGenerator() {
       });
 
       setResult(res);
+
+      if (onStateChange) {
+        onStateChange({
+          qr_type: qrType,
+          content: payloadData,
+          fields: payloadFields,
+          generated_result: res,
+          metadata: { format, size: Number(size), error_correction: errorCorrection }
+        });
+      }
+
+      // Persist to QR history
+      saveQrHistoryApi({
+        action_type: 'generate',
+        qr_type: qrType,
+        content: typeof payloadData === 'string' ? payloadData : JSON.stringify(payloadData || payloadFields),
+        fields: payloadFields,
+        metadata: {
+          format,
+          size: Number(size),
+          error_correction: errorCorrection,
+          version: res.version
+        }
+      }).catch((histErr) => console.warn('QR history save notice:', histErr));
     } catch (err) {
       const msg = err.response?.data?.detail || err.message || 'Failed to generate QR Code.';
       setError(msg);
