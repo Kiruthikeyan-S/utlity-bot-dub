@@ -79,7 +79,7 @@ if __name__ == "__main__":
     import uvicorn
     from main import app
 
-    requested_port = int(os.environ.get("PORT", 8000))
+    requested_port = int(os.environ.get("PORT", 8080))
     host = os.environ.get("HOST", "0.0.0.0")
 
     port = free_port_if_busy(requested_port)

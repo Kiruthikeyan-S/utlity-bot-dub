@@ -30,6 +30,6 @@ app = service_main.app
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", 8080))
     host = os.environ.get("HOST", "0.0.0.0")
     uvicorn.run("main:app", host=host, port=port, reload=True)

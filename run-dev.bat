@@ -3,8 +3,8 @@ echo ============================================================
 echo Starting AI ID Document Extractor (React + FastAPI Stack)
 echo ============================================================
 
-echo 1. Starting Python FastAPI Backend on port 8000...
-start "Python FastAPI Backend (Port 8000)" cmd /k "cd /d python_service && python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
+echo 1. Starting Python FastAPI Backend on port 8080...
+start "Python FastAPI Backend (Port 8080)" cmd /k "cd /d python_service && python -m uvicorn main:app --host 0.0.0.0 --port 8080 --reload"
 
 timeout /t 2 /nobreak >nul
 
@@ -14,6 +14,6 @@ start "React Client (Port 5173)" cmd /k "cd /d client && npm run dev"
 echo ============================================================
 echo All services launched!
 echo - React Frontend: http://localhost:5173
-echo - Python FastAPI API: http://localhost:8000/docs
+echo - Python FastAPI API: http://localhost:8080/docs
 echo ============================================================
 pause
