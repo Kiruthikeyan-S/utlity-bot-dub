@@ -62,11 +62,27 @@ api.interceptors.request.use(async (config) => {
   return Promise.reject(error);
 });
 
-// Response Interceptor: Handle HTTP 401 Unauthorized responses and expired sessions
+// Response Interceptor: Handle HTTP 401 Unauthorized responses with transparent token refresh
 api.interceptors.response.use(
   (response) => response,
   async (error) => {
-    if (error.response && error.response.status === 401) {
+    const originalRequest = error.config;
+    if (error.response && error.response.status === 401 && originalRequest && !originalRequest._retry) {
+      originalRequest._retry = true;
+      try {
+        const currentUser = auth.currentUser;
+        if (currentUser) {
+          const freshToken = await currentUser.getIdToken(true);
+          if (freshToken) {
+            originalRequest.headers = originalRequest.headers || {};
+            originalRequest.headers.Authorization = `Bearer ${freshToken}`;
+            return api(originalRequest);
+          }
+        }
+      } catch (refreshErr) {
+        console.warn('[API Interceptor] Token refresh failed:', refreshErr);
+      }
+
       console.warn('[API Interceptor] 401 Unauthorized - session expired or invalid credentials.');
       try {
         await logoutUser();
