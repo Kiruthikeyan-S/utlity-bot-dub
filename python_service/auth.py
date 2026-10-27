@@ -16,6 +16,7 @@ from firebase_admin import auth as admin_auth, credentials
 from google.oauth2 import id_token as google_id_token
 from google.auth.transport import requests as google_requests
 from google.auth.exceptions import GoogleAuthError
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -27,35 +28,46 @@ FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "utility-bot-web")
 FIREBASE_SERVICE_ACCOUNT = os.getenv("FIREBASE_SERVICE_ACCOUNT_KEY")
 
 _firebase_initialized = False
-_google_request = google_requests.Request()
+_has_service_account_creds = False
+
+try:
+    import cachecontrol
+    _http_session = cachecontrol.CacheControl(requests.Session())
+except ImportError:
+    _http_session = requests.Session()
+
+_google_request = google_requests.Request(session=_http_session)
 
 def initialize_firebase():
-    """Initializes Firebase Admin SDK if not already initialized."""
-    global _firebase_initialized
-    if _firebase_initialized or firebase_admin._apps:
-        _firebase_initialized = True
+    """Initializes Firebase Admin SDK when service account credentials are provided."""
+    global _firebase_initialized, _has_service_account_creds
+    if _firebase_initialized:
         return
 
     try:
-        if FIREBASE_SERVICE_ACCOUNT:
+        if FIREBASE_SERVICE_ACCOUNT and FIREBASE_SERVICE_ACCOUNT.strip():
             if os.path.exists(FIREBASE_SERVICE_ACCOUNT):
                 cred = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT)
-                firebase_admin.initialize_app(cred)
+                if not firebase_admin._apps:
+                    firebase_admin.initialize_app(cred)
+                _has_service_account_creds = True
                 logger.info("Firebase Admin initialized using service account file.")
             else:
-                # Try parsing as JSON string
                 try:
                     sa_dict = json.loads(FIREBASE_SERVICE_ACCOUNT)
                     cred = credentials.Certificate(sa_dict)
-                    firebase_admin.initialize_app(cred)
+                    if not firebase_admin._apps:
+                        firebase_admin.initialize_app(cred)
+                    _has_service_account_creds = True
                     logger.info("Firebase Admin initialized using service account JSON string.")
                 except Exception as parse_err:
                     logger.warning(f"Failed to parse FIREBASE_SERVICE_ACCOUNT_KEY: {parse_err}")
-                    firebase_admin.initialize_app(options={"projectId": FIREBASE_PROJECT_ID})
+                    _has_service_account_creds = False
         else:
-            # Initialize with project ID for token verification via Google Public Keys
-            firebase_admin.initialize_app(options={"projectId": FIREBASE_PROJECT_ID})
-            logger.info(f"Firebase Admin initialized with projectId: {FIREBASE_PROJECT_ID}")
+            logger.info(
+                f"No FIREBASE_SERVICE_ACCOUNT_KEY set; using Google OAuth2 cached public x509 certificates for project '{FIREBASE_PROJECT_ID}'."
+            )
+            _has_service_account_creds = False
         _firebase_initialized = True
     except Exception as e:
         logger.error(f"Failed to initialize Firebase Admin: {e}")
@@ -111,8 +123,9 @@ def verify_token(token: str) -> Dict[str, Any]:
 
     last_error_detail = "Could not validate credentials."
 
-    # 2. Cryptographic Verifier 1: Firebase Admin SDK
-    if _firebase_initialized:
+    # 2. Cryptographic Verifier 1: Firebase Admin SDK (only when service account credentials exist,
+    # avoiding 12s GCE metadata server timeout on non-GCP hosts)
+    if _firebase_initialized and _has_service_account_creds:
         try:
             decoded_token = admin_auth.verify_id_token(clean_token)
             uid = decoded_token.get("uid") or decoded_token.get("sub") or decoded_token.get("user_id")
