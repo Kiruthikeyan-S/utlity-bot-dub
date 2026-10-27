@@ -1,13 +1,12 @@
 """
 auth.py - Firebase Authentication & Token Verification Guard.
-Verifies Firebase ID tokens using the Firebase Admin SDK, extracts the authenticated
-user's UID, and secures protected endpoints against unauthorized access.
+Verifies Firebase ID tokens using the Firebase Admin SDK or Google OAuth2 public certificates,
+extracts the authenticated user's UID, and secures protected endpoints against unauthorized access.
+Never trusts unverified claims or decodes tokens without cryptographic signature verification.
 """
 
 import os
 import json
-import time
-import base64
 import logging
 from typing import Optional, Dict, Any
 from fastapi import Depends, HTTPException, status
@@ -16,6 +15,7 @@ import firebase_admin
 from firebase_admin import auth as admin_auth, credentials
 from google.oauth2 import id_token as google_id_token
 from google.auth.transport import requests as google_requests
+from google.auth.exceptions import GoogleAuthError
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -70,12 +70,17 @@ security = HTTPBearer(auto_error=False)
 
 def verify_token(token: str) -> Dict[str, Any]:
     """
-    Verifies a Firebase ID token and returns the decoded token payload.
-    Supports multi-tier verification:
-    1. Mock test tokens (for local unit & regression tests)
-    2. Firebase Admin SDK (when service account credentials exist)
-    3. Google OAuth2 Public Certificates via verify_firebase_token (no service account needed)
-    4. Safe cryptographic claims verification (fallback for unexpired tokens issued to utility-bot-web)
+    Verifies a Firebase ID token cryptographically and returns the verified token claims.
+
+    Security guarantees:
+    1. Rejects missing, empty, or whitespace tokens.
+    2. Mock test tokens are strictly guarded: NEVER permitted in production, only when
+       ALLOW_TEST_MOCK_TOKENS="true" AND ENVIRONMENT/NODE_ENV is NOT production.
+    3. Cryptographic Verifier 1: Firebase Admin SDK verify_id_token (when credentials exist).
+    4. Cryptographic Verifier 2: Google OAuth2 verify_firebase_token (verifies RSA signature
+       against Google's official x509 public certificates for FIREBASE_PROJECT_ID).
+    5. If both verifiers fail, unconditionally rejects the request with HTTP 401 Unauthorized.
+       Never decodes or trusts claims (aud, iss, sub, user_id, exp) from an unverified token.
     """
     if not token or not token.strip():
         raise HTTPException(
@@ -86,17 +91,31 @@ def verify_token(token: str) -> Dict[str, Any]:
 
     clean_token = token.strip()
 
-    # 1. Special handling for local/test mock tokens if specifically configured
-    if os.getenv("ALLOW_TEST_MOCK_TOKENS", "false").lower() == "true":
-        if clean_token.startswith("test_token_"):
-            mock_uid = clean_token[len("test_token_"):]
-            return {"uid": mock_uid, "sub": mock_uid, "email": f"{mock_uid}@test.local", "auth_time": 0}
+    # 1. Guarded test mock tokens (for automated test suites ONLY)
+    # Strictly prohibited if running in production or if not explicitly enabled
+    env_name = (os.getenv("ENVIRONMENT") or os.getenv("NODE_ENV") or "development").strip().lower()
+    is_production = env_name in ("production", "prod")
+    allow_mock = os.getenv("ALLOW_TEST_MOCK_TOKENS", "false").strip().lower() == "true"
 
-    # 2. Try Firebase Admin SDK verification (preferred when service account is present)
+    if allow_mock and not is_production:
+        if clean_token.startswith("test_token_"):
+            mock_uid = clean_token[len("test_token_"):].strip()
+            if mock_uid:
+                return {
+                    "uid": mock_uid,
+                    "sub": mock_uid,
+                    "user_id": mock_uid,
+                    "email": f"{mock_uid}@test.local",
+                    "auth_time": 0
+                }
+
+    last_error_detail = "Could not validate credentials."
+
+    # 2. Cryptographic Verifier 1: Firebase Admin SDK
     if _firebase_initialized:
         try:
             decoded_token = admin_auth.verify_id_token(clean_token)
-            uid = decoded_token.get("uid") or decoded_token.get("sub")
+            uid = decoded_token.get("uid") or decoded_token.get("sub") or decoded_token.get("user_id")
             if uid:
                 decoded_token["uid"] = uid
                 return decoded_token
@@ -112,10 +131,14 @@ def verify_token(token: str) -> Dict[str, Any]:
                 detail="Authentication token has been revoked.",
                 headers={"WWW-Authenticate": "Bearer"},
             )
+        except admin_auth.InvalidIdTokenError as e:
+            logger.debug(f"Firebase Admin InvalidIdTokenError: {e}")
+            last_error_detail = "Invalid authentication token."
         except Exception as admin_err:
             logger.debug(f"Firebase Admin verify notice (falling back to Google public certs): {admin_err}")
 
-    # 3. Verify via Google OAuth2 public certificates (zero private keys / ADC required)
+    # 3. Cryptographic Verifier 2: Google OAuth2 Firebase Token Verifier
+    # Cryptographically validates RSA signature against Google x509 certs, expiry, issuer, and audience
     try:
         decoded_token = google_id_token.verify_firebase_token(
             clean_token,
@@ -123,48 +146,45 @@ def verify_token(token: str) -> Dict[str, Any]:
             audience=FIREBASE_PROJECT_ID
         )
         if decoded_token:
-            uid = decoded_token.get("user_id") or decoded_token.get("sub")
+            uid = decoded_token.get("user_id") or decoded_token.get("sub") or decoded_token.get("uid")
             if uid:
                 decoded_token["uid"] = uid
                 return decoded_token
     except ValueError as val_err:
-        logger.debug(f"Google public key verify notice: {val_err}")
+        err_msg = str(val_err)
+        logger.debug(f"Google public key verify error: {err_msg}")
+        if "expired" in err_msg.lower():
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication token has expired. Please sign in again.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        last_error_detail = "Invalid authentication token."
+    except GoogleAuthError as auth_err:
+        err_msg = str(auth_err)
+        logger.debug(f"Google auth error: {err_msg}")
+        if "expired" in err_msg.lower():
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication token has expired. Please sign in again.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        last_error_detail = "Invalid authentication token."
     except Exception as g_err:
-        logger.debug(f"Google public key network/cert notice: {g_err}")
+        err_msg = str(g_err)
+        logger.debug(f"Token verification error: {err_msg}")
+        if "expired" in err_msg.lower():
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication token has expired. Please sign in again.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        last_error_detail = "Invalid authentication token."
 
-    # 4. Safe claims verification for valid unexpired Firebase tokens issued to this project
-    try:
-        parts = clean_token.split(".")
-        if len(parts) == 3:
-            payload_b64 = parts[1]
-            padded = payload_b64 + "=" * (-len(payload_b64) % 4)
-            claims = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
-
-            expected_iss = f"https://securetoken.google.com/{FIREBASE_PROJECT_ID}"
-            aud = claims.get("aud")
-            iss = claims.get("iss")
-            exp = claims.get("exp")
-            uid = claims.get("user_id") or claims.get("sub")
-
-            now = time.time()
-            if aud == FIREBASE_PROJECT_ID and iss == expected_iss and uid:
-                if exp and exp < (now - 60):
-                    raise HTTPException(
-                        status_code=status.HTTP_401_UNAUTHORIZED,
-                        detail="Authentication token has expired. Please sign in again.",
-                        headers={"WWW-Authenticate": "Bearer"},
-                    )
-                claims["uid"] = uid
-                logger.info(f"Verified Firebase ID token claims for UID: {uid}")
-                return claims
-    except HTTPException:
-        raise
-    except Exception as parse_err:
-        logger.warning(f"Failed to parse token claims: {parse_err}")
-
+    # 4. If both verifiers fail, REJECT with HTTP 401. Never trust unverified claims.
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials.",
+        detail=last_error_detail,
         headers={"WWW-Authenticate": "Bearer"},
     )
 
