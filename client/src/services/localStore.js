@@ -14,27 +14,60 @@ const DB_NAME = 'UtilityBotLocalDB';
 const DB_VERSION = 1;
 const STORE_NAME = 'verification_records';
 
+let cachedDb = null;
+
 function openDatabase() {
+  if (cachedDb) {
+    return Promise.resolve(cachedDb);
+  }
+
   return new Promise((resolve, reject) => {
     if (typeof window === 'undefined' || !window.indexedDB) {
       return reject(new Error('IndexedDB not supported in this environment.'));
     }
 
-    const request = window.indexedDB.open(DB_NAME, DB_VERSION);
+    const timer = setTimeout(() => {
+      reject(new Error('IndexedDB open timed out.'));
+    }, 1200);
 
-    request.onupgradeneeded = (event) => {
-      const db = event.target.result;
-      if (!db.objectStoreNames.contains(STORE_NAME)) {
-        const store = db.createObjectStore(STORE_NAME, { keyPath: 'storageKey' });
-        store.createIndex('partitionKey', 'partitionKey', { unique: false });
-        store.createIndex('ownerUid', 'ownerUid', { unique: false });
-        store.createIndex('deviceId', 'deviceId', { unique: false });
-        store.createIndex('createdAt', 'createdAt', { unique: false });
-      }
-    };
+    try {
+      const request = window.indexedDB.open(DB_NAME, DB_VERSION);
 
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+      request.onupgradeneeded = (event) => {
+        const db = event.target.result;
+        if (!db.objectStoreNames.contains(STORE_NAME)) {
+          const store = db.createObjectStore(STORE_NAME, { keyPath: 'storageKey' });
+          store.createIndex('partitionKey', 'partitionKey', { unique: false });
+          store.createIndex('ownerUid', 'ownerUid', { unique: false });
+          store.createIndex('deviceId', 'deviceId', { unique: false });
+          store.createIndex('createdAt', 'createdAt', { unique: false });
+        }
+      };
+
+      request.onsuccess = () => {
+        clearTimeout(timer);
+        cachedDb = request.result;
+        cachedDb.onclose = () => { cachedDb = null; };
+        cachedDb.onversionchange = () => {
+          cachedDb.close();
+          cachedDb = null;
+        };
+        resolve(cachedDb);
+      };
+
+      request.onerror = () => {
+        clearTimeout(timer);
+        reject(request.error);
+      };
+
+      request.onblocked = () => {
+        clearTimeout(timer);
+        reject(new Error('IndexedDB open blocked.'));
+      };
+    } catch (err) {
+      clearTimeout(timer);
+      reject(err);
+    }
   });
 }
 

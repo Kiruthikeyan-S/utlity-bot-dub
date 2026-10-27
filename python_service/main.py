@@ -19,6 +19,7 @@ except Exception:
     pass
 
 from typing import Optional, Dict, Any, List
+import cv2
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -276,6 +277,15 @@ def confirm_verification_decision(
                 owner_uid=owner_uid
             )
             res["reference_card"] = ref_record
+            if isinstance(res.get("record"), dict):
+                res["record"]["reference_card"] = ref_record
+                try:
+                    from storage import sync_record_to_mongodb, MONGODB_URI
+                    if MONGODB_URI:
+                        seq_id = res.get("sequential_id") or res.get("id")
+                        sync_record_to_mongodb("verifications", seq_id, res["record"])
+                except Exception:
+                    pass
         except Exception as ref_err:
             print(f"[Confirmation] Reference generation notice: {ref_err}")
             res["reference_card"] = None

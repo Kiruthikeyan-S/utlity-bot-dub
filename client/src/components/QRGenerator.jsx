@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   QrCode, 
   Download, 
@@ -79,6 +79,46 @@ export default function QRGenerator({ initialData = null, onStateChange = null }
   const [result, setResult] = useState(initialData?.generated_result || null);
   const [copied, setCopied] = useState(false);
 
+  // Sync restored history item into generator form & preview
+  useEffect(() => {
+    if (!initialData) return;
+    const restoredType = initialData.qr_type || 'url';
+    setQrType(restoredType);
+    if (initialData.metadata?.error_correction) setErrorCorrection(initialData.metadata.error_correction);
+    if (initialData.metadata?.size) setSize(initialData.metadata.size);
+    if (initialData.metadata?.format) setFormat(initialData.metadata.format);
+
+    const c = initialData.content || '';
+    const f = initialData.fields || {};
+    if (restoredType === 'url') setUrlVal(c || 'https://');
+    if (restoredType === 'text') setTextVal(c);
+    if (restoredType === 'phone') setPhoneVal(f.phone || c);
+    if (restoredType === 'email') setEmailFields({ email: '', subject: '', body: '', ...f });
+    if (restoredType === 'sms') setSmsFields({ phone: '', message: '', ...f });
+    if (restoredType === 'wifi') setWifiFields({ ssid: '', password: '', auth_type: 'WPA', hidden: false, ...f });
+    if (restoredType === 'vcard') setVcardFields({ name: '', phone: '', email: '', company: '', title: '', address: '', url: '', ...f });
+    if (restoredType === 'location') setLocationFields({ latitude: '', longitude: '', ...f });
+    if (restoredType === 'product') setProductVal(c);
+    if (restoredType === 'order') setOrderVal(c);
+    if (restoredType === 'shipping') setShippingFields({ shipping_id: '', tracking_url: '', ...f });
+    if (restoredType === 'json') setJsonVal(c);
+
+    if (initialData.generated_result) {
+      setResult(initialData.generated_result);
+    } else if (c || Object.keys(f).length > 0) {
+      generateQrApi({
+        type: restoredType,
+        data: c,
+        fields: f,
+        size: Number(initialData.metadata?.size || 400),
+        error_correction: initialData.metadata?.error_correction || 'M',
+        format: initialData.metadata?.format || 'png'
+      })
+        .then((genRes) => setResult(genRes))
+        .catch(() => {});
+    }
+  }, [initialData]);
+
   const handleGenerate = async (e) => {
     if (e) e.preventDefault();
     setError(null);
@@ -156,6 +196,7 @@ export default function QRGenerator({ initialData = null, onStateChange = null }
         qr_type: qrType,
         content: typeof payloadData === 'string' ? payloadData : JSON.stringify(payloadData || payloadFields),
         fields: payloadFields,
+        generated_result: res,
         metadata: {
           format,
           size: Number(size),

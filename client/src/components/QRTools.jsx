@@ -1,11 +1,16 @@
-import React from 'react';
-import { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { QrCode, Scan, Layers } from 'lucide-react';
 import QRGenerator from './QRGenerator';
 import QRScanner from './QRScanner';
 
 export default function QRTools({ sessionState = null, onSessionStateChange = null }) {
   const [activeTab, setActiveTab] = useState(sessionState?.activeTab || 'generate'); // 'generate' | 'scan'
+
+  useEffect(() => {
+    if (sessionState?.activeTab && sessionState.activeTab !== activeTab) {
+      setActiveTab(sessionState.activeTab);
+    }
+  }, [sessionState?.activeTab]);
 
   const handleTabChange = (tab) => {
     setActiveTab(tab);

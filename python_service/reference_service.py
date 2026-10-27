@@ -275,36 +275,39 @@ def revoke_reference_by_id(
         return False
 
     records = read_reference_records()
-    found = False
+    found_local = False
     for rec in records:
         if rec.get("reference_id") == ref_id:
-            # Check owner
             if rec.get("owner_uid") != owner_uid:
                 return False
             rec["revoked"] = True
             rec["revoked_at"] = datetime.now(timezone.utc).isoformat()
             rec["verification_status"] = "REVOKED"
-            found = True
+            found_local = True
             break
-            
-    if found:
+
+    if found_local:
         write_reference_records(records)
-        try:
-            from storage import get_mongo_client, MONGODB_DB_NAME
-            client = get_mongo_client()
-            if client:
-                db = client[MONGODB_DB_NAME]
-                db["identity_references"].update_one(
-                    {"reference_id": ref_id, "owner_uid": owner_uid},
-                    {
-                        "$set": {
-                            "revoked": True, 
-                            "verification_status": "REVOKED",
-                            "revoked_at": datetime.now(timezone.utc).isoformat()
-                        }
+
+    found_mongo = False
+    try:
+        from storage import get_mongo_client, MONGODB_DB_NAME
+        client = get_mongo_client()
+        if client:
+            db = client[MONGODB_DB_NAME]
+            res = db["identity_references"].update_one(
+                {"reference_id": ref_id, "owner_uid": owner_uid},
+                {
+                    "$set": {
+                        "revoked": True, 
+                        "verification_status": "REVOKED",
+                        "revoked_at": datetime.now(timezone.utc).isoformat()
                     }
-                )
-        except Exception as e:
-            logger.warning(f"Failed to sync reference revocation to MongoDB: {e}")
-        return True
-    return False
+                }
+            )
+            if res.matched_count > 0:
+                found_mongo = True
+    except Exception as e:
+        logger.warning(f"Failed to sync reference revocation to MongoDB: {e}")
+
+    return found_local or found_mongo

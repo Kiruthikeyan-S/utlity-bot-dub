@@ -13,6 +13,9 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 import certifi
+from dotenv import load_dotenv
+
+load_dotenv()
 
 try:
     import pymongo
@@ -43,15 +46,17 @@ if not os.path.exists(COUNTERS_FILE):
 # ---------------------------------------------------------------------------
 # MongoDB Atlas Database Configuration
 # Requires: MONGODB_URI in .env
+# Dedicated History Database: utility_bot_history
 # ---------------------------------------------------------------------------
 MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DATA_API_KEY = os.getenv("MONGODB_DATA_API_KEY", "")
 MONGODB_APP_ID = os.getenv("MONGODB_APP_ID", "")
-MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "utility_bot")
+MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "utility_bot_history")
 MONGODB_CLUSTER = os.getenv("MONGODB_CLUSTER", "Cluster0")
 
 _ATLAS_DATA_URL = f"https://data.mongodb-api.com/app/{MONGODB_APP_ID}/endpoint/data/v1" if MONGODB_APP_ID else ""
 IS_MONGO_ONLINE = False
+_mongo_client = None
 
 
 def _atlas_request(action: str, collection: str, body: dict) -> dict:
@@ -86,20 +91,27 @@ def _atlas_request(action: str, collection: str, body: dict) -> dict:
 
 def get_mongo_client():
     """
-    Returns a native MongoClient with strictly verified TLS certificates.
-    Removes insecure tlsAllowInvalidCertificates=True and uses trusted certifi bundle.
+    Returns a cached, thread-safe singleton MongoClient with verified TLS certificates.
+    Reusing the pooled client avoids expensive repeated DNS SRV + TLS handshakes on every request.
     """
+    global _mongo_client
     if not MONGODB_URI:
         return None
+    if _mongo_client is not None:
+        return _mongo_client
     try:
         import pymongo
-        return pymongo.MongoClient(
+        _mongo_client = pymongo.MongoClient(
             MONGODB_URI,
             tls=True,
             tlsCAFile=certifi.where(),
             tlsAllowInvalidCertificates=False,
-            serverSelectionTimeoutMS=4000
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=5000,
+            socketTimeoutMS=10000,
+            maxPoolSize=20
         )
+        return _mongo_client
     except Exception as err:
         logger.warning(f"MongoDB connection notice: {err}")
         return None
@@ -439,6 +451,14 @@ def get_history(
                 for d in docs:
                     if "_id" in d and not isinstance(d["_id"], str):
                         d["_id"] = str(d["_id"])
+                    # Ensure reference_card is attached if stored in identity_references
+                    if not d.get("reference_card"):
+                        ref_doc = db["identity_references"].find_one(
+                            {"verification_id": d["_id"], "owner_uid": owner_uid},
+                            {"_id": 0}
+                        )
+                        if ref_doc:
+                            d["reference_card"] = ref_doc
                 pages = (total + limit - 1) // limit if total > 0 else 1
                 return {
                     "documents": docs,
@@ -448,7 +468,8 @@ def get_history(
                     "deviceId": device_id,
                     "owner_uid": owner_uid,
                     "retentionDays": RETENTION_DAYS,
-                    "source": "mongodb_atlas"
+                    "source": "mongodb_atlas",
+                    "database": MONGODB_DB_NAME
                 }
         except Exception as mongo_err:
             logger.warning(f"Error querying MongoDB Atlas history: {mongo_err}")
@@ -549,14 +570,7 @@ def get_extraction_by_id(
     if not owner_uid:
         return None
 
-    history = read_history(auto_purge=True)
-    for doc in history:
-        if doc.get("_id") == doc_id or doc.get("sequentialId") == doc_id:
-            if doc.get("owner_uid") != owner_uid:
-                return None
-            return doc
-
-    # Also check MongoDB if not in local cache
+    # Check MongoDB Atlas first
     if MONGODB_URI:
         try:
             client = get_mongo_client()
@@ -564,9 +578,25 @@ def get_extraction_by_id(
                 db = client[MONGODB_DB_NAME]
                 doc = db["verifications"].find_one({"_id": doc_id, "owner_uid": owner_uid})
                 if doc:
+                    if "_id" in doc and not isinstance(doc["_id"], str):
+                        doc["_id"] = str(doc["_id"])
+                    if not doc.get("reference_card"):
+                        ref_doc = db["identity_references"].find_one(
+                            {"verification_id": doc["_id"], "owner_uid": owner_uid},
+                            {"_id": 0}
+                        )
+                        if ref_doc:
+                            doc["reference_card"] = ref_doc
                     return doc
         except Exception:
             pass
+
+    history = read_history(auto_purge=True)
+    for doc in history:
+        if doc.get("_id") == doc_id or doc.get("sequentialId") == doc_id:
+            if doc.get("owner_uid") != owner_uid:
+                return None
+            return doc
 
     return None
 
@@ -582,29 +612,32 @@ def delete_extraction_by_id(
 
     history = read_history(auto_purge=False)
     new_history = []
-    found = False
+    found_local = False
     for d in history:
         if d.get("_id") == doc_id or d.get("sequentialId") == doc_id:
-            # Only delete if owner matches
             if d.get("owner_uid") != owner_uid:
                 new_history.append(d)
                 continue
-            found = True
+            found_local = True
         else:
             new_history.append(d)
-            
-    if found:
+
+    if found_local:
         write_file_records(HISTORY_FILE, new_history)
-        if MONGODB_URI:
-            try:
-                client = get_mongo_client()
-                if client:
-                    db = client[MONGODB_DB_NAME]
-                    db["verifications"].delete_one({"_id": doc_id, "owner_uid": owner_uid})
-            except Exception:
-                pass
-        return True
-    return False
+
+    found_mongo = False
+    if MONGODB_URI:
+        try:
+            client = get_mongo_client()
+            if client:
+                db = client[MONGODB_DB_NAME]
+                res = db["verifications"].delete_one({"_id": doc_id, "owner_uid": owner_uid})
+                if res.deleted_count > 0:
+                    found_mongo = True
+        except Exception:
+            pass
+
+    return found_local or found_mongo
 
 
 # ---------------------------------------------------------------------------
@@ -762,25 +795,29 @@ def delete_shipping_record_by_id(
 
     records = read_file_records(SHIPPING_HISTORY_FILE, auto_purge=False)
     new_records = []
-    found = False
+    found_local = False
     for d in records:
         if (d.get("_id") == doc_id or d.get("sequentialId") == doc_id) and d.get("owner_uid") == owner_uid:
-            found = True
+            found_local = True
         else:
             new_records.append(d)
 
-    if found:
+    if found_local:
         write_file_records(SHIPPING_HISTORY_FILE, new_records)
-        if MONGODB_URI:
-            try:
-                client = get_mongo_client()
-                if client:
-                    db = client[MONGODB_DB_NAME]
-                    db["shipping_history"].delete_one({"_id": doc_id, "owner_uid": owner_uid})
-            except Exception:
-                pass
-        return True
-    return False
+
+    found_mongo = False
+    if MONGODB_URI:
+        try:
+            client = get_mongo_client()
+            if client:
+                db = client[MONGODB_DB_NAME]
+                res = db["shipping_history"].delete_one({"_id": doc_id, "owner_uid": owner_uid})
+                if res.deleted_count > 0:
+                    found_mongo = True
+        except Exception:
+            pass
+
+    return found_local or found_mongo
 
 
 # ---------------------------------------------------------------------------
@@ -807,15 +844,33 @@ def save_qr_record(
     action_type = record_data.get("action_type") or record_data.get("action") or "generate"
     qr_type = record_data.get("qr_type") or record_data.get("type") or "text"
 
-    # Sanitize Wi-Fi and passwords - NEVER store plaintext passwords
+    # Sanitize Wi-Fi and passwords - NEVER store plaintext passwords in fields or content
     raw_fields = dict(record_data.get("fields") or {})
     if "password" in raw_fields:
         raw_fields["password"] = "***"
 
     raw_content = record_data.get("content") or record_data.get("data") or ""
-    if isinstance(raw_content, str) and "P:" in raw_content and "WIFI:" in raw_content:
+    if isinstance(raw_content, str):
         import re
-        raw_content = re.sub(r'P:[^;]*;', 'P:***;', raw_content)
+        if "P:" in raw_content and "WIFI:" in raw_content:
+            raw_content = re.sub(r'P:[^;]*;', 'P:***;', raw_content)
+        if '"password"' in raw_content:
+            try:
+                parsed_json = json.loads(raw_content)
+                if isinstance(parsed_json, dict) and "password" in parsed_json:
+                    parsed_json["password"] = "***"
+                    raw_content = json.dumps(parsed_json)
+            except Exception:
+                raw_content = re.sub(r'"password"\s*:\s*"[^"]*"', '"password":"***"', raw_content)
+
+    # Also sanitize inside generated_result if present
+    gen_res = record_data.get("generated_result")
+    if isinstance(gen_res, dict):
+        gen_res = dict(gen_res)
+        enc_payload = gen_res.get("encoded_payload")
+        if isinstance(enc_payload, str) and "P:" in enc_payload and "WIFI:" in enc_payload:
+            import re
+            gen_res["encoded_payload"] = re.sub(r'P:[^;]*;', 'P:***;', enc_payload)
 
     record = {
         "_id": seq_id,
@@ -828,6 +883,8 @@ def save_qr_record(
         "content_type": record_data.get("content_type") or qr_type,
         "content": raw_content,
         "fields": raw_fields,
+        "generated_result": gen_res,
+        "annotated_image": record_data.get("annotated_image"),
         "metadata": record_data.get("metadata") or {
             "format": record_data.get("format", "png"),
             "size": record_data.get("size", 400),
@@ -962,32 +1019,70 @@ def delete_qr_record_by_id(
 
     records = read_file_records(QR_HISTORY_FILE, auto_purge=False)
     new_records = []
-    found = False
+    found_local = False
     for d in records:
         if (d.get("_id") == doc_id or d.get("sequentialId") == doc_id) and d.get("owner_uid") == owner_uid:
-            found = True
+            found_local = True
         else:
             new_records.append(d)
 
-    if found:
+    if found_local:
         write_file_records(QR_HISTORY_FILE, new_records)
-        if MONGODB_URI:
-            try:
-                client = get_mongo_client()
-                if client:
-                    db = client[MONGODB_DB_NAME]
-                    db["qr_history"].delete_one({"_id": doc_id, "owner_uid": owner_uid})
-            except Exception:
-                pass
-        return True
-    return False
+
+    found_mongo = False
+    if MONGODB_URI:
+        try:
+            client = get_mongo_client()
+            if client:
+                db = client[MONGODB_DB_NAME]
+                res = db["qr_history"].delete_one({"_id": doc_id, "owner_uid": owner_uid})
+                if res.deleted_count > 0:
+                    found_mongo = True
+        except Exception:
+            pass
+
+    return found_local or found_mongo
 
 
 def get_storage_stats(
     device_id: Optional[str] = None, 
     owner_uid: Optional[str] = None
 ) -> Dict[str, Any]:
-    """Returns storage space usage and record count for the requesting authenticated user."""
+    """Returns storage space usage and record count for the requesting authenticated user from MongoDB Atlas (or local fallback)."""
+    if owner_uid and MONGODB_URI:
+        try:
+            client = get_mongo_client()
+            if client:
+                db = client[MONGODB_DB_NAME]
+                q = {"owner_uid": owner_uid}
+                n_hist = db["verifications"].count_documents(q)
+                n_fail = db["failed_verifications"].count_documents(q)
+                n_ship = db["shipping_history"].count_documents(q)
+                n_qr = db["qr_history"].count_documents(q)
+                total_records = n_hist + n_fail + n_ship + n_qr
+                est_bytes = total_records * 18432  # ~18 KB avg per record
+                kb_size = round(est_bytes / 1024.0, 1)
+                mb_size = round(est_bytes / (1024.0 * 1024.0), 2)
+                return {
+                    "deviceRecords": n_hist,
+                    "totalSuccessRecords": n_hist,
+                    "totalFailedRecords": n_fail,
+                    "totalShippingRecords": n_ship,
+                    "totalQrRecords": n_qr,
+                    "totalRecords": total_records,
+                    "maxRecords": 500,
+                    "retentionDays": RETENTION_DAYS,
+                    "storageSizeBytes": est_bytes,
+                    "storageSizeKB": kb_size,
+                    "storageSizeMB": mb_size,
+                    "percentUsed": min(100, round((total_records / 500.0) * 100, 1)),
+                    "deviceId": device_id,
+                    "owner_uid": owner_uid,
+                    "databaseEngine": f"MongoDB Atlas ({MONGODB_DB_NAME})"
+                }
+        except Exception as err:
+            logger.warning(f"MongoDB stats notice: {err}")
+
     history = read_history(auto_purge=True)
     failed = read_failed_history(auto_purge=True)
     shipping = read_file_records(SHIPPING_HISTORY_FILE, auto_purge=True)

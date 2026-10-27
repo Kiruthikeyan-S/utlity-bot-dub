@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   Scan, 
   UploadCloud, 
@@ -26,6 +26,17 @@ export default function QRScanner({ initialData = null, onStateChange = null }) 
   const [error, setError] = useState(null);
   const [results, setResults] = useState(initialData?.scan_results || initialData?.results || null);
   const [copiedKey, setCopiedKey] = useState(null);
+
+  useEffect(() => {
+    const incoming = initialData?.scan_results || initialData?.results || null;
+    if (incoming) {
+      setResults(incoming);
+      if (incoming.annotated_image) {
+        setPreviewUrl(incoming.annotated_image);
+      }
+      setError(null);
+    }
+  }, [initialData]);
 
   const fileInputRef = useRef(null);
 
@@ -89,6 +100,7 @@ export default function QRScanner({ initialData = null, onStateChange = null }) 
         action_type: 'scan',
         qr_type: 'scan',
         content: detectedContent,
+        annotated_image: res.annotated_image || null,
         barcodes: res.barcodes || [],
         qr_codes: res.qr_codes || [],
         ocr: res.ocr || null,

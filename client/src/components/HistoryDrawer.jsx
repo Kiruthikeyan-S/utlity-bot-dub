@@ -91,9 +91,14 @@ export default function HistoryDrawer({
         .catch(() => {});
 
       if (activeCategory === 'id') {
+        const safeLocalPromise = Promise.race([
+          getLocalRecords(ownerUid).catch(() => []),
+          new Promise((resolve) => setTimeout(() => resolve([]), 1200))
+        ]);
+
         const [historyData, localRecords] = await Promise.all([
           getHistoryApi({ limit: 50, doc_type: typeFilter || undefined }),
-          getLocalRecords(ownerUid).catch(() => []),
+          safeLocalPromise,
         ]);
 
         if (activeRequestUidRef.current !== ownerUid) return;

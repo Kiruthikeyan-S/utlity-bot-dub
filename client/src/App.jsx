@@ -433,6 +433,7 @@ export default function App() {
               scannerData: {
                 scan_results: {
                   filename: qrDoc.metadata?.filename || 'Restored Scan',
+                  annotated_image: qrDoc.annotated_image || null,
                   qr_codes: qrDoc.qr_codes || [],
                   barcodes: qrDoc.barcodes || [],
                   ocr: qrDoc.ocr || null,
